@@ -1,35 +1,82 @@
 # Upstream Balance Monitor
 
-轻量上游余额监控，当前支持 New API 和 Sub2API。
+Lightweight balance monitoring for upstream AI relay channels. It currently supports New API and Sub2API, stores channel access tokens after login validation, tracks recharge records from upstream logs, and sends WeCom alerts when balances are low.
 
-## 运行
+[中文文档](README.zh-CN.md) | [Citation](CITATION.md)
+
+## Preview
+
+![Secure access screen](docs/images/login.png)
+
+![Balance dashboard](docs/images/dashboard.png)
+
+## Features
+
+- First-run admin registration with optional TOTP 2FA.
+- New API and Sub2API channel balance refresh.
+- Channel add flow with live login test before saving.
+- Encrypted upstream access tokens and encrypted WeCom webhook storage.
+- Recharge log sync from upstream APIs.
+- Hourly WeCom summary plus low-balance alert under the configured CNY threshold.
+- SQLite storage and single-service Docker deployment.
+
+## Quick Start
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 python3 app.py
 ```
 
-默认监听 `127.0.0.1:8756`。
+The app listens on `127.0.0.1:8756` by default.
 
-首次打开页面会创建管理员账号。登录后可以在页面里绑定 TOTP 2FA。
+Docker:
 
-## 数据
+```bash
+docker compose up -d --build
+```
 
-- SQLite: `data/upstreams.sqlite3`
-- 加密密钥: `data/secret.key`
-- Session 密钥: `data/session.secret`
+The Compose file binds the service to `127.0.0.1:8756`, which works well behind an HTTPS reverse proxy.
 
-渠道新增时会先用账号密码测试上游登录，然后只保存加密后的上游访问令牌。企业微信 webhook 使用本机密钥加密后存储。
+## Data And Security
 
-充值日志读取上游自身接口：New API 使用 `/api/user/topup/self`，Sub2API 使用 `/api/v1/payment/orders/my`。本地只保存金额、状态、类型、时间和哈希后的来源引用。
+- SQLite database: `data/upstreams.sqlite3`
+- Encryption key: `data/secret.key`
+- Session key: `data/session.secret`
 
-## 自动化
+When a channel is added, the app uses the submitted upstream username and password for one login validation request. After validation succeeds, it stores the encrypted upstream access token and keeps the password field empty. The WeCom webhook is also encrypted with the local key.
 
-- 每 5 分钟探测一次余额。
-- 保留 72 小时历史点。
-- 企业微信汇总默认每小时一次。
-- 折算 CNY 余额低于 100 时发送企业微信告警，同一渠道默认 6 小时冷却一次。
+Recharge records are synced from upstream APIs:
 
-## 接口
+- New API: `/api/user/topup/self`
+- Sub2API: `/api/v1/payment/orders/my`
+
+Local recharge storage keeps amount, status, type, time, and a hashed source reference.
+
+## Automation
+
+- Balance refresh interval: every 5 minutes.
+- Balance history retention: 72 hours.
+- WeCom summary interval: every hour.
+- Low balance alert threshold: CNY 100 by default.
+- Low balance alert cooldown: 6 hours per channel by default.
+
+## Environment Variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HOST` | `127.0.0.1` | Flask bind host for local runs |
+| `PORT` | `8756` | Service port |
+| `REFRESH_INTERVAL_SECONDS` | `300` | Balance refresh interval |
+| `NOTIFY_INTERVAL_SECONDS` | `3600` | WeCom summary interval |
+| `HISTORY_RETENTION_HOURS` | `72` | Balance history retention |
+| `DEFAULT_CNY_RATE` | `7.3` | Default CNY/USD conversion rate |
+| `LOW_BALANCE_ALERT_CNY` | `100` | Low balance alert threshold |
+| `LOW_BALANCE_ALERT_COOLDOWN_SECONDS` | `21600` | Alert cooldown per channel |
+| `UPSTREAM_REQUEST_TIMEOUT` | `25` | Upstream request timeout |
+
+## API Endpoints
 
 - `GET /api/auth/bootstrap`
 - `POST /api/auth/register`
@@ -39,6 +86,8 @@ python3 app.py
 - `POST /api/auth/2fa/confirm`
 - `GET /api/channels`
 - `POST /api/channels`
+- `PUT /api/channels/:id`
+- `DELETE /api/channels/:id`
 - `POST /api/channels/:id/refresh`
 - `POST /api/refresh`
 - `GET /api/recharges`
