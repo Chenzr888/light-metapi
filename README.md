@@ -20,6 +20,8 @@ python3 app.py
 
 渠道新增时会先用账号密码测试上游登录，然后只保存加密后的上游访问令牌。企业微信 webhook 使用本机密钥加密后存储。
 
+充值日志读取上游自身接口：New API 使用 `/api/user/topup/self`，Sub2API 使用 `/api/v1/payment/orders/my`。本地只保存金额、状态、类型、时间和哈希后的来源引用。
+
 ## 自动化
 
 - 每 5 分钟探测一次余额。

@@ -159,15 +159,27 @@ def init_db():
                 amount_cny REAL NOT NULL,
                 cny_rate REAL NOT NULL,
                 detected_at TEXT NOT NULL,
+                source_ref TEXT,
+                source_status TEXT,
+                source_type TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(channel_id) REFERENCES channels(id) ON DELETE CASCADE
             )
             """
         )
+        ensure_column(conn, "recharge_logs", "source_ref", "TEXT")
+        ensure_column(conn, "recharge_logs", "source_status", "TEXT")
+        ensure_column(conn, "recharge_logs", "source_type", "TEXT")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_recharge_logs_channel_time
             ON recharge_logs(channel_id, detected_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_recharge_logs_channel_source
+            ON recharge_logs(channel_id, source_ref)
             """
         )
         conn.execute(
@@ -395,6 +407,8 @@ def list_recharge_logs(channel_id=None, limit=80):
                    r.amount_cny,
                    r.cny_rate,
                    r.detected_at,
+                   r.source_status,
+                   r.source_type,
                    r.created_at
             FROM recharge_logs r
             JOIN channels c ON c.id = r.channel_id
@@ -405,6 +419,11 @@ def list_recharge_logs(channel_id=None, limit=80):
             args,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def source_hash(*parts):
+    raw = "|".join(str(part or "") for part in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def record_balance_history(conn, channel_id, result, checked_at):
@@ -444,33 +463,52 @@ def record_failure_history(conn, channel_id, row, error, checked_at):
     )
 
 
-def record_recharge_if_needed(conn, channel_id, previous_balance, next_balance, cny_rate, detected_at):
-    before = decimal_from(previous_balance)
-    after = decimal_from(next_balance)
-    if before is None or after is None:
-        return
-    amount_usd = after - before
-    if amount_usd <= Decimal("0.000001"):
-        return
+def record_recharge_log(conn, channel_id, log, cny_rate):
+    amount_usd = decimal_from(log.get("amount_usd"))
+    if amount_usd is None or amount_usd <= 0:
+        return False
     rate = rate_from(cny_rate)
+    detected_at = log.get("detected_at") or now_iso()
+    source_ref = log.get("source_ref") or source_hash(channel_id, amount_usd, detected_at, log.get("source_status"))
     conn.execute(
         """
         INSERT INTO recharge_logs(
-            channel_id, before_balance, after_balance, amount_usd, amount_cny, cny_rate, detected_at, created_at
+            channel_id, before_balance, after_balance, amount_usd, amount_cny, cny_rate,
+            detected_at, source_ref, source_status, source_type, created_at
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(channel_id, source_ref) DO UPDATE SET
+            amount_usd = excluded.amount_usd,
+            amount_cny = excluded.amount_cny,
+            cny_rate = excluded.cny_rate,
+            detected_at = excluded.detected_at,
+            source_status = excluded.source_status,
+            source_type = excluded.source_type
         """,
         (
             channel_id,
-            as_float(before),
-            as_float(after),
+            as_float(amount_usd),
             as_float(amount_usd),
             as_float(amount_usd * rate),
             as_float(rate),
             detected_at,
+            source_ref,
+            log.get("source_status", ""),
+            log.get("source_type", ""),
             detected_at,
         ),
     )
+    return True
+
+
+def sync_recharge_logs(conn, channel, logs):
+    if not logs:
+        return 0
+    count = 0
+    for log in logs:
+        if record_recharge_log(conn, channel["id"], log, channel["cny_rate"]):
+            count += 1
+    return count
 
 
 def prune_history(conn):
@@ -545,6 +583,51 @@ def extract_sub2api_payload(data):
     return data if isinstance(data, dict) else {}
 
 
+def paginated_items(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("items", "records", "list", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = paginated_items(value)
+            if nested:
+                return nested
+    return []
+
+
+def iso_from_unix(value):
+    try:
+        ts = int(value or 0)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+def stable_time(value):
+    if not value:
+        return ""
+    if isinstance(value, (int, float)):
+        return iso_from_unix(value)
+    text = str(value)
+    if text.isdigit():
+        return iso_from_unix(text)
+    return text
+
+
+def successful_new_api_topup(status):
+    return str(status or "").lower() == "success"
+
+
+def successful_sub2api_order(status):
+    return str(status or "").upper() == "COMPLETED"
+
+
 def sub2api_login(base_url, username, password):
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
@@ -611,6 +694,41 @@ def sub2api_profile(base_url, access_token):
     return extract_sub2api_payload(profile_data)
 
 
+def sub2api_recharge_logs(base_url, access_token):
+    resp = requests.get(
+        urljoin(base_url, "/api/v1/payment/orders/my"),
+        params={"page": 1, "page_size": 50, "order_type": "balance"},
+        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    data = safe_json(resp)
+    if resp.status_code >= 400:
+        raise RuntimeError(read_message(data) or f"payment orders 读取失败 HTTP {resp.status_code}")
+    logs = []
+    for item in paginated_items(extract_sub2api_payload(data)):
+        if not isinstance(item, dict) or not successful_sub2api_order(item.get("status")):
+            continue
+        amount = decimal_from(item.get("amount"))
+        if amount is None or amount <= 0:
+            continue
+        detected_at = stable_time(item.get("completed_at") or item.get("paid_at") or item.get("created_at")) or now_iso()
+        logs.append({
+            "amount_usd": amount,
+            "detected_at": detected_at,
+            "source_ref": source_hash(
+                "sub2api",
+                item.get("id"),
+                item.get("created_at"),
+                item.get("completed_at"),
+                item.get("status"),
+                amount,
+            ),
+            "source_status": item.get("status", ""),
+            "source_type": item.get("payment_type", ""),
+        })
+    return logs
+
+
 def build_sub2api_result(profile_payload, fallback_user=None):
     if not profile_payload and fallback_user:
         profile_payload = fallback_user
@@ -628,12 +746,10 @@ def build_sub2api_result(profile_payload, fallback_user=None):
         "currency": "USD",
         "status": "ok",
         "message": "",
+        "recharge_logs": [],
         "raw_response": {
-            "user_id": profile_payload.get("id"),
-            "email": profile_payload.get("email"),
             "role": profile_payload.get("role"),
             "concurrency": profile_payload.get("concurrency"),
-            "allowed_groups": profile_payload.get("allowed_groups"),
             "status": profile_payload.get("status"),
         },
     }
@@ -646,7 +762,9 @@ def fetch_sub2api(channel):
 
     if credential.get("access_token"):
         try:
-            return build_sub2api_result(sub2api_profile(base_url, credential["access_token"]))
+            result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]))
+            result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
+            return result
         except RuntimeError as exc:
             message = str(exc).lower()
             if "401" not in message and "unauthorized" not in message:
@@ -654,13 +772,16 @@ def fetch_sub2api(channel):
             credential = sub2api_refresh(base_url, credential.get("refresh_token"))
             if channel_id:
                 save_channel_credential(channel_id, credential)
-            return build_sub2api_result(sub2api_profile(base_url, credential["access_token"]))
+            result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]))
+            result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
+            return result
 
     password_enc = channel_value(channel, "password_enc", "")
     if not password_enc:
         raise RuntimeError("缺少可用令牌，请重新添加渠道")
     credential, user = sub2api_login(base_url, channel["username"], decrypt(password_enc))
     result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]), user)
+    result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
     if channel_id:
         save_channel_credential(channel_id, credential)
     return result
@@ -725,6 +846,50 @@ def new_api_self(base_url, credential, session=None):
     return self_data.get("data") if isinstance(self_data.get("data"), dict) else {}
 
 
+def new_api_recharge_logs(base_url, credential, session=None):
+    token = credential.get("access_token")
+    user_id = credential.get("user_id")
+    headers = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if user_id:
+        headers["New-Api-User"] = str(user_id)
+    client = session or requests.Session()
+    resp = client.get(
+        urljoin(base_url, "/api/user/topup/self"),
+        params={"p": 1, "page_size": 50},
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
+    data = safe_json(resp)
+    if resp.status_code >= 400 or not truthy_success(data):
+        raise RuntimeError(read_message(data) or f"topup 记录读取失败 HTTP {resp.status_code}")
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    logs = []
+    for item in paginated_items(payload):
+        if not isinstance(item, dict) or not successful_new_api_topup(item.get("status")):
+            continue
+        amount = decimal_from(item.get("amount"))
+        if amount is None or amount <= 0:
+            continue
+        detected_at = stable_time(item.get("complete_time") or item.get("create_time")) or now_iso()
+        logs.append({
+            "amount_usd": amount,
+            "detected_at": detected_at,
+            "source_ref": source_hash(
+                "new_api",
+                item.get("id"),
+                item.get("create_time"),
+                item.get("complete_time"),
+                item.get("status"),
+                amount,
+            ),
+            "source_status": item.get("status", ""),
+            "source_type": item.get("payment_method") or item.get("payment_provider") or "",
+        })
+    return logs
+
+
 def build_new_api_result(base_url, payload):
     raw_quota = decimal_from(payload.get("quota"))
     if raw_quota is None:
@@ -744,10 +909,8 @@ def build_new_api_result(base_url, payload):
         "currency": "USD",
         "status": "ok",
         "message": "",
+        "recharge_logs": [],
         "raw_response": {
-            "user_id": payload.get("id"),
-            "username": payload.get("username"),
-            "display_name": payload.get("display_name"),
             "group": payload.get("group"),
             "quota_per_unit": float(quota_per_unit),
         },
@@ -760,7 +923,9 @@ def fetch_new_api(channel):
     channel_id = channel_value(channel, "id")
 
     if credential.get("access_token"):
-        return build_new_api_result(base_url, new_api_self(base_url, credential))
+        result = build_new_api_result(base_url, new_api_self(base_url, credential))
+        result["recharge_logs"] = new_api_recharge_logs(base_url, credential)
+        return result
 
     password_enc = channel_value(channel, "password_enc", "")
     if not password_enc:
@@ -768,6 +933,7 @@ def fetch_new_api(channel):
     session, user = new_api_login(base_url, channel["username"], decrypt(password_enc))
     credential = new_api_generate_token(base_url, session, user.get("id"))
     result = build_new_api_result(base_url, new_api_self(base_url, credential, session=session))
+    result["recharge_logs"] = new_api_recharge_logs(base_url, credential, session=session)
     if channel_id:
         save_channel_credential(channel_id, credential)
     return result
@@ -778,10 +944,12 @@ def provision_channel(platform, base_url, username, password):
         session, user = new_api_login(base_url, username, password)
         credential = new_api_generate_token(base_url, session, user.get("id"))
         result = build_new_api_result(base_url, new_api_self(base_url, credential, session=session))
+        result["recharge_logs"] = new_api_recharge_logs(base_url, credential, session=session)
         return credential, result
     if platform == "sub2api":
         credential, user = sub2api_login(base_url, username, password)
         result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]), user)
+        result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
         return credential, result
     raise RuntimeError(f"未知平台: {platform}")
 
@@ -834,15 +1002,6 @@ def fetch_channel(channel):
 def persist_result(channel_id, result):
     checked_at = now_iso()
     with db() as conn:
-        row = conn.execute("SELECT balance, cny_rate FROM channels WHERE id = ?", (channel_id,)).fetchone()
-        record_recharge_if_needed(
-            conn,
-            channel_id,
-            row["balance"] if row else None,
-            result.get("balance"),
-            row["cny_rate"] if row else DEFAULT_CNY_RATE,
-            checked_at,
-        )
         conn.execute(
             """
             UPDATE channels
@@ -874,6 +1033,9 @@ def persist_result(channel_id, result):
                 channel_id,
             ),
         )
+        row = conn.execute("SELECT * FROM channels WHERE id = ?", (channel_id,)).fetchone()
+        if row:
+            sync_recharge_logs(conn, row, result.get("recharge_logs") or [])
         record_balance_history(conn, channel_id, result, checked_at)
         prune_history(conn)
 
@@ -1217,6 +1379,9 @@ def api_create_channel():
                 ts,
             ),
         )
+        row = conn.execute("SELECT * FROM channels WHERE id = ?", (cur.lastrowid,)).fetchone()
+        if row:
+            sync_recharge_logs(conn, row, result.get("recharge_logs") or [])
         record_balance_history(conn, cur.lastrowid, result, ts)
         prune_history(conn)
     return jsonify({"ok": True, "data": row_to_channel(get_channel(cur.lastrowid))})
@@ -1249,7 +1414,6 @@ def api_update_channel(channel_id):
     ts = now_iso()
     with db() as conn:
         if result:
-            record_recharge_if_needed(conn, channel_id, row["balance"], result.get("balance"), cny_rate, ts)
             conn.execute(
                 """
                 UPDATE channels
@@ -1296,6 +1460,9 @@ def api_update_channel(channel_id):
                     channel_id,
                 ),
             )
+            updated = conn.execute("SELECT * FROM channels WHERE id = ?", (channel_id,)).fetchone()
+            if updated:
+                sync_recharge_logs(conn, updated, result.get("recharge_logs") or [])
             record_balance_history(conn, channel_id, result, ts)
             prune_history(conn)
         else:

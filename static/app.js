@@ -236,9 +236,9 @@ function renderChannels() {
 function renderRecharges() {
   const list = el("rechargeList");
   const logs = state.recharges || [];
-  el("rechargeSummary").textContent = logs.length ? `最近 ${logs.length} 条余额上涨记录` : "暂未识别到充值";
+  el("rechargeSummary").textContent = logs.length ? `最近 ${logs.length} 条上游充值记录` : "暂未读取到充值记录";
   if (!logs.length) {
-    list.innerHTML = '<div class="empty compact-empty">余额上涨后会自动记录充值日志。</div>';
+    list.innerHTML = '<div class="empty compact-empty">刷新渠道后会读取 New API / Sub2API 的上游充值记录。</div>';
     return;
   }
   list.innerHTML = logs.map((item) => `
@@ -251,7 +251,7 @@ function renderRecharges() {
         <span class="balance small">+${money(item.amount_usd)} USD</span>
         <div class="used">${money(item.amount_cny, 2)} CNY，比例 ${money(item.cny_rate, 4)}</div>
       </div>
-      <div class="used">${money(item.before_balance)} → ${money(item.after_balance)} USD</div>
+      <div class="used">${escapeHtml(item.source_status || "-")} ${escapeHtml(item.source_type || "")}</div>
       <div class="last-check">${shortTime(item.detected_at)}</div>
     </article>
   `).join("");
