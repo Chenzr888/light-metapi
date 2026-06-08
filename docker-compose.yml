@@ -1,0 +1,18 @@
+services:
+  upstream-balance:
+    build: .
+    container_name: upstream-balance
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8756
+      REFRESH_INTERVAL_SECONDS: 300
+      NOTIFY_INTERVAL_SECONDS: 3600
+      HISTORY_RETENTION_HOURS: 72
+      LOW_BALANCE_ALERT_CNY: 100
+      LOW_BALANCE_ALERT_COOLDOWN_SECONDS: 21600
+      UPSTREAM_REQUEST_TIMEOUT: 25
+    ports:
+      - "127.0.0.1:8756:8756"
+    volumes:
+      - ./data:/app/data

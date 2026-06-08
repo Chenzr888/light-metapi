@@ -1,0 +1,530 @@
+const state = {
+  channels: [],
+  recharges: [],
+  settings: null,
+  auth: null,
+  busy: false,
+};
+
+const apiBase = new URL(".", window.location.href).pathname.replace(/\/$/, "");
+const el = (id) => document.getElementById(id);
+
+function money(value, digits = 4) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+  return Number(value).toLocaleString(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: digits,
+  });
+}
+
+function timeText(value) {
+  if (!value) return "未刷新";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+function shortTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function platformText(platform) {
+  return platform === "sub2api" ? "Sub2API" : "New API";
+}
+
+function toast(message) {
+  const node = el("toast");
+  node.textContent = message;
+  node.classList.add("show");
+  clearTimeout(window.__toastTimer);
+  window.__toastTimer = setTimeout(() => node.classList.remove("show"), 2600);
+}
+
+function setAuthed(value) {
+  el("loginView").classList.toggle("hidden", value);
+  document.querySelector(".app-shell").classList.toggle("hidden", !value);
+}
+
+function renderAuthControls() {
+  const authed = Boolean(state.auth?.authenticated);
+  const twofaEnabled = Boolean(state.auth?.totp_enabled);
+  const userBadge = el("userBadge");
+  const twofaBtn = el("twofaBtn");
+  const logoutBtn = el("logoutBtn");
+
+  if (userBadge) {
+    userBadge.textContent = state.auth?.username || "已登录";
+  }
+  if (twofaBtn) {
+    twofaBtn.textContent = twofaEnabled ? "2FA 已绑定" : "绑定 2FA";
+    twofaBtn.disabled = state.busy || !authed || twofaEnabled;
+  }
+  if (logoutBtn) {
+    logoutBtn.disabled = state.busy || !authed;
+  }
+}
+
+function renderAuth() {
+  const auth = state.auth || {};
+  const authed = Boolean(auth.authenticated);
+  const needsSetup = Boolean(auth.needs_setup);
+  const form = el("loginForm");
+
+  setAuthed(authed);
+  el("loginTitle").textContent = needsSetup ? "创建管理员账号" : "上游额度管理";
+  el("loginCopy").textContent = needsSetup ? "首次打开请创建管理员账号，进入后可选择绑定 2FA。" : "输入管理员账号密码；已绑定 2FA 时填写验证码。";
+  el("loginSubmit").textContent = needsSetup ? "创建并进入" : "登录进入";
+  el("totpLoginField").classList.toggle("hidden", needsSetup);
+  form.elements.password.autocomplete = needsSetup ? "new-password" : "current-password";
+  form.elements.totp.required = false;
+
+  if (!authed || auth.totp_enabled) {
+    el("twofaPanel").classList.add("hidden");
+  }
+  renderAuthControls();
+}
+
+async function api(path, options = {}) {
+  const target = `${apiBase}${path}`;
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  const res = await fetch(target, {
+    ...options,
+    credentials: "same-origin",
+    headers,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) {
+    if (res.status === 401) {
+      state.auth = { needs_setup: false, authenticated: false, username: "", totp_enabled: false };
+      renderAuth();
+    }
+    throw new Error(data.message || `请求失败 ${res.status}`);
+  }
+  return data.data;
+}
+
+async function loadAuth() {
+  state.auth = await api("/api/auth/bootstrap");
+  renderAuth();
+  return state.auth;
+}
+
+function setBusy(value) {
+  state.busy = value;
+  for (const node of document.querySelectorAll("button")) {
+    node.disabled = value;
+  }
+  renderAuthControls();
+}
+
+async function loadSettings() {
+  state.settings = await api("/api/settings");
+  el("notifyEnabled").checked = Boolean(state.settings.notify_enabled);
+  el("wecomHint").textContent = `每 ${Math.round(state.settings.refresh_interval_seconds / 60)} 分钟探测一次，低于 ${money(state.settings.low_balance_alert_cny, 2)} CNY 自动告警。`;
+  const status = el("wecomStatus");
+  status.textContent = state.settings.wecom_configured ? "已配置" : "未配置";
+  status.className = `pill ${state.settings.wecom_configured ? "ok" : ""}`;
+}
+
+async function loadChannels() {
+  state.channels = await api("/api/channels");
+  renderChannels();
+}
+
+async function loadRecharges() {
+  state.recharges = await api("/api/recharges?limit=80");
+  renderRecharges();
+}
+
+function sparkline(history) {
+  const rawPoints = (history || [])
+    .filter((item) => item.status === "ok" && item.balance !== null && item.balance !== undefined);
+  const points = rawPoints.length > 80
+    ? rawPoints.filter((_, index) => index % Math.ceil(rawPoints.length / 80) === 0).slice(-80)
+    : rawPoints;
+  if (points.length < 2) {
+    return '<div class="spark empty-spark">暂无趋势</div>';
+  }
+  const values = points.map((item) => Number(item.balance));
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min || 1;
+  const coords = values.map((value, index) => {
+    const x = (index / (values.length - 1)) * 120;
+    const y = 34 - ((value - min) / span) * 28;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return `
+    <svg class="spark" viewBox="0 0 120 40" role="img" aria-label="72 小时余额趋势">
+      <polyline points="${coords}" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"></polyline>
+    </svg>
+  `;
+}
+
+function renderChannels() {
+  const list = el("channelList");
+  const channels = state.channels;
+  if (!channels.length) {
+    list.innerHTML = '<div class="empty">还没有渠道，先添加一个 New API 或 Sub2API 上游。</div>';
+    el("summaryText").textContent = "0 个渠道";
+    return;
+  }
+
+  const ok = channels.filter((item) => item.status === "ok").length;
+  const total = channels.length;
+  const totalBalance = channels
+    .filter((item) => item.status === "ok")
+    .reduce((sum, item) => sum + Number(item.balance || 0), 0);
+  const totalCny = channels
+    .filter((item) => item.status === "ok")
+    .reduce((sum, item) => sum + Number(item.cny_balance || 0), 0);
+  el("summaryText").textContent = `${ok}/${total} 正常，合计 ${money(totalBalance)} USD / ${money(totalCny, 2)} CNY`;
+
+  list.innerHTML = channels.map((item) => {
+    const statusClass = item.status === "ok" ? "ok" : item.status === "error" ? "error" : "";
+    const statusText = item.status === "ok" ? "正常" : item.status === "error" ? "异常" : "待刷新";
+    const used = item.used_balance !== null && item.used_balance !== undefined
+      ? `<div class="used">已用 ${money(item.used_balance)} USD / ${money(item.cny_used_balance, 2)} CNY</div>`
+      : "";
+    const message = item.status === "error" && item.message
+      ? `<div class="used">${escapeHtml(item.message)}</div>`
+      : used;
+    return `
+      <article class="channel-card">
+        <div class="channel-title">
+          <strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong>
+          <a class="site-link" href="${escapeAttr(item.base_url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(item.base_url)}">
+            ${escapeHtml(item.base_url)}
+          </a>
+        </div>
+        <div>
+          <span class="platform">${platformText(item.platform)}</span>
+          <div class="meta">${escapeHtml(item.username)}</div>
+        </div>
+        <div>
+          <span class="pill ${statusClass}">${statusText}</span>
+          <div class="last-check">${timeText(item.last_checked_at)}</div>
+        </div>
+        <div>
+          <div class="balance">${money(item.balance)} USD</div>
+          <div class="cny">${money(item.cny_balance, 2)} CNY</div>
+          ${message}
+        </div>
+        <div class="trend-cell">
+          ${sparkline(item.history)}
+          <div class="meta">${(item.history || []).length} 点 / 72h</div>
+        </div>
+        <form class="rate-form" data-id="${item.id}">
+          <label>
+            <span>比例</span>
+            <input name="cny_rate" type="number" min="0.0001" step="0.0001" value="${escapeAttr(item.cny_rate || 7.3)}" />
+          </label>
+          <button class="btn ghost" type="submit">保存</button>
+        </form>
+        <div class="card-actions">
+          <button class="btn icon-btn" data-action="refresh" data-id="${item.id}" type="button">刷新</button>
+          <button class="btn danger icon-btn" data-action="delete" data-id="${item.id}" type="button">删除</button>
+        </div>
+      </article>
+    `;
+  }).join("");
+}
+
+function renderRecharges() {
+  const list = el("rechargeList");
+  const logs = state.recharges || [];
+  el("rechargeSummary").textContent = logs.length ? `最近 ${logs.length} 条余额上涨记录` : "暂未识别到充值";
+  if (!logs.length) {
+    list.innerHTML = '<div class="empty compact-empty">余额上涨后会自动记录充值日志。</div>';
+    return;
+  }
+  list.innerHTML = logs.map((item) => `
+    <article class="recharge-row">
+      <div>
+        <strong>${escapeHtml(item.channel_name)}</strong>
+        <a class="site-link" href="${escapeAttr(item.base_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.base_url)}</a>
+      </div>
+      <div>
+        <span class="balance small">+${money(item.amount_usd)} USD</span>
+        <div class="used">${money(item.amount_cny, 2)} CNY，比例 ${money(item.cny_rate, 4)}</div>
+      </div>
+      <div class="used">${money(item.before_balance)} → ${money(item.after_balance)} USD</div>
+      <div class="last-check">${shortTime(item.detected_at)}</div>
+    </article>
+  `).join("");
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value).replaceAll("'", "&#39;");
+}
+
+async function handleLogin(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const payload = Object.fromEntries(new FormData(form).entries());
+  payload.username = (payload.username || "").trim();
+  if (!payload.totp) delete payload.totp;
+  const registering = Boolean(state.auth?.needs_setup);
+
+  setBusy(true);
+  try {
+    state.auth = await api(registering ? "/api/auth/register" : "/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    form.reset();
+    renderAuth();
+    await loadApp();
+    toast(registering ? "管理员账号已创建" : "登录成功");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function logout() {
+  setBusy(true);
+  try {
+    await api("/api/auth/logout", { method: "POST", body: "{}" });
+    await loadAuth();
+    el("loginForm").reset();
+    toast("已退出");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function setupTwofa() {
+  setBusy(true);
+  try {
+    const data = await api("/api/auth/2fa/setup", { method: "POST", body: "{}" });
+    el("twofaSecret").textContent = data.secret;
+    el("twofaUri").href = data.otpauth_uri;
+    el("twofaPanel").classList.remove("hidden");
+    toast("请用验证器添加密钥");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function confirmTwofa(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const payload = Object.fromEntries(new FormData(form).entries());
+  setBusy(true);
+  try {
+    state.auth = await api("/api/auth/2fa/confirm", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    form.reset();
+    el("twofaPanel").classList.add("hidden");
+    renderAuth();
+    toast("2FA 已绑定");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function createChannel(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const payload = Object.fromEntries(new FormData(form).entries());
+  setBusy(true);
+  try {
+    await api("/api/channels", { method: "POST", body: JSON.stringify(payload) });
+    form.reset();
+    const rateInput = form.querySelector('[name="cny_rate"]');
+    if (rateInput) rateInput.value = String(state.settings?.default_cny_rate || 7.3);
+    await Promise.all([loadChannels(), loadRecharges()]);
+    toast("渠道已添加");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  setBusy(true);
+  try {
+    await api("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        wecom_webhook: el("wecomWebhook").value.trim(),
+        notify_enabled: el("notifyEnabled").checked,
+      }),
+    });
+    el("wecomWebhook").value = "";
+    await loadSettings();
+    toast("配置已保存");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function clearWecom() {
+  setBusy(true);
+  try {
+    await api("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({ clear_wecom: true, wecom_webhook: "", notify_enabled: el("notifyEnabled").checked }),
+    });
+    await loadSettings();
+    toast("企业微信配置已清空");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function testWecom() {
+  setBusy(true);
+  try {
+    await api("/api/settings/test-wecom", { method: "POST", body: "{}" });
+    toast("测试消息已发送");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function refreshAll(notify = false) {
+  setBusy(true);
+  try {
+    state.channels = await api("/api/refresh", {
+      method: "POST",
+      body: JSON.stringify({ notify }),
+    });
+    await loadRecharges();
+    renderChannels();
+    toast(notify ? "刷新完成并已推送" : "刷新完成");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function updateRate(form) {
+  const id = form.dataset.id;
+  const channel = state.channels.find((item) => String(item.id) === String(id));
+  if (!channel) return;
+  const payload = {
+    name: channel.name,
+    platform: channel.platform,
+    base_url: channel.base_url,
+    username: channel.username,
+    enabled: channel.enabled,
+    cny_rate: form.elements.cny_rate.value,
+  };
+  setBusy(true);
+  try {
+    await api(`/api/channels/${id}`, { method: "PUT", body: JSON.stringify(payload) });
+    await loadChannels();
+    toast("比例已保存");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function handleListClick(event) {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const id = button.dataset.id;
+  const action = button.dataset.action;
+  if (action === "refresh") {
+    setBusy(true);
+    try {
+      await api(`/api/channels/${id}/refresh`, { method: "POST", body: "{}" });
+      await Promise.all([loadChannels(), loadRecharges()]);
+      toast("渠道已刷新");
+    } catch (error) {
+      await loadChannels();
+      toast(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  if (action === "delete") {
+    const channel = state.channels.find((item) => String(item.id) === String(id));
+    const ok = window.confirm(`删除 ${channel?.name || "这个渠道"}？`);
+    if (!ok) return;
+    setBusy(true);
+    try {
+      await api(`/api/channels/${id}`, { method: "DELETE" });
+      await Promise.all([loadChannels(), loadRecharges()]);
+      toast("渠道已删除");
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+}
+
+async function handleListSubmit(event) {
+  const form = event.target.closest(".rate-form");
+  if (!form) return;
+  event.preventDefault();
+  await updateRate(form);
+}
+
+async function loadApp() {
+  await Promise.all([loadSettings(), loadChannels(), loadRecharges()]);
+  const rateInput = document.querySelector('#channelForm [name="cny_rate"]');
+  if (rateInput && state.settings?.default_cny_rate) {
+    rateInput.value = String(state.settings.default_cny_rate);
+  }
+}
+
+async function boot() {
+  el("loginForm").addEventListener("submit", handleLogin);
+  el("logoutBtn").addEventListener("click", logout);
+  el("twofaBtn").addEventListener("click", setupTwofa);
+  el("twofaConfirmForm").addEventListener("submit", confirmTwofa);
+  el("settingsForm").addEventListener("submit", saveSettings);
+  el("channelForm").addEventListener("submit", createChannel);
+  el("refreshAllBtn").addEventListener("click", () => refreshAll(false));
+  el("notifyBtn").addEventListener("click", () => refreshAll(true));
+  el("testWecomBtn").addEventListener("click", testWecom);
+  el("clearWecomBtn").addEventListener("click", clearWecom);
+  el("channelList").addEventListener("click", handleListClick);
+  el("channelList").addEventListener("submit", handleListSubmit);
+
+  try {
+    const auth = await loadAuth();
+    if (auth.authenticated) {
+      await loadApp();
+    }
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+boot();

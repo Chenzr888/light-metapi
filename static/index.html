@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>上游余额监控</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <section id="loginView" class="login-view">
+      <form id="loginForm" class="login-card">
+        <p class="eyebrow">Secure Access</p>
+        <h1 id="loginTitle">上游额度管理</h1>
+        <p id="loginCopy" class="login-copy">首次打开请创建管理员账号。</p>
+        <label>
+          <span>账号</span>
+          <input name="username" autocomplete="username" required />
+        </label>
+        <label>
+          <span>密码</span>
+          <input name="password" type="password" autocomplete="current-password" required />
+        </label>
+        <label id="totpLoginField">
+          <span>2FA 验证码</span>
+          <input name="totp" inputmode="numeric" autocomplete="one-time-code" />
+        </label>
+        <button id="loginSubmit" class="btn primary" type="submit">登录进入</button>
+      </form>
+    </section>
+
+    <div class="app-shell hidden">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Upstream Balance</p>
+          <h1>上游额度管理</h1>
+        </div>
+        <div class="toolbar">
+          <span id="userBadge" class="pill">已登录</span>
+          <button id="twofaBtn" class="btn ghost" type="button">绑定 2FA</button>
+          <button id="logoutBtn" class="btn ghost" type="button">退出</button>
+          <button id="refreshAllBtn" class="btn primary" type="button">刷新全部</button>
+          <button id="notifyBtn" class="btn ghost" type="button">刷新并推送</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="panel config-panel">
+          <div class="panel-head">
+            <div>
+              <h2>企业微信</h2>
+              <p id="wecomHint">每 5 分钟探测一次，自动推送保持每小时一次。</p>
+            </div>
+            <span id="wecomStatus" class="pill">读取中</span>
+          </div>
+
+          <form id="settingsForm" class="form-grid">
+            <label>
+              <span>Webhook</span>
+              <input id="wecomWebhook" type="password" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." />
+            </label>
+            <label class="switch-line">
+              <input id="notifyEnabled" type="checkbox" checked />
+              <span>开启自动推送</span>
+            </label>
+            <div class="actions">
+              <button class="btn primary" type="submit">保存配置</button>
+              <button id="testWecomBtn" class="btn ghost" type="button">发送测试</button>
+              <button id="clearWecomBtn" class="btn danger" type="button">清空</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel add-panel">
+          <div class="panel-head">
+            <div>
+              <h2>添加渠道</h2>
+              <p>支持 New API 和 Sub2API，新增时测试成功后只保存加密令牌。</p>
+            </div>
+          </div>
+
+          <form id="channelForm" class="form-grid">
+            <div class="two-col">
+              <label>
+                <span>名称</span>
+                <input name="name" placeholder="Primary New API / Backup Sub2API" />
+              </label>
+              <label>
+                <span>类型</span>
+                <select name="platform">
+                  <option value="new_api">New API</option>
+                  <option value="sub2api">Sub2API</option>
+                </select>
+              </label>
+            </div>
+            <label>
+              <span>URL</span>
+              <input name="base_url" required placeholder="https://example.com/" />
+            </label>
+            <label>
+              <span>充值比例 CNY / USD</span>
+              <input name="cny_rate" type="number" min="0.0001" step="0.0001" value="7.3" />
+            </label>
+            <div class="two-col">
+              <label>
+                <span>账号</span>
+                <input name="username" required placeholder="邮箱或用户名" />
+              </label>
+              <label>
+                <span>密码</span>
+                <input name="password" type="password" required placeholder="登录密码" />
+              </label>
+            </div>
+            <div class="actions">
+              <button class="btn primary" type="submit">测试并保存</button>
+            </div>
+          </form>
+        </section>
+      </main>
+
+      <section class="panel table-panel">
+        <div class="panel-head">
+          <div>
+            <h2>渠道列表</h2>
+            <p id="summaryText">等待数据</p>
+          </div>
+        </div>
+        <div id="channelList" class="channel-list"></div>
+      </section>
+
+      <section id="twofaPanel" class="panel twofa-panel hidden">
+        <div class="panel-head">
+          <div>
+            <h2>绑定 2FA</h2>
+            <p>用 Google Authenticator、1Password 或其他验证器添加密钥，再输入 6 位验证码确认。</p>
+          </div>
+        </div>
+        <div class="twofa-box">
+          <code id="twofaSecret" class="secret-code"></code>
+          <a id="twofaUri" class="site-link" href="#" target="_blank" rel="noopener noreferrer">打开 otpauth 链接</a>
+          <form id="twofaConfirmForm" class="rate-form">
+            <label>
+              <span>验证码</span>
+              <input name="totp" inputmode="numeric" autocomplete="one-time-code" required />
+            </label>
+            <button class="btn primary" type="submit">确认绑定</button>
+          </form>
+        </div>
+      </section>
+
+      <section class="panel recharge-panel">
+        <div class="panel-head">
+          <div>
+            <h2>充值日志</h2>
+            <p id="rechargeSummary">自动识别余额上涨记录</p>
+          </div>
+        </div>
+        <div id="rechargeList" class="recharge-list"></div>
+      </section>
+    </div>
+
+    <div id="toast" class="toast"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
