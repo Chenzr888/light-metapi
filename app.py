@@ -367,8 +367,8 @@ def verify_totp(secret, code, window=1):
 
 
 def totp_uri(username, secret):
-    label = quote(f"Upstream Balance:{username}")
-    issuer = quote("Upstream Balance")
+    label = quote(f"light-metapi:{username}")
+    issuer = quote("light-metapi")
     return f"otpauth://totp/{label}?secret={normalize_totp_secret(secret)}&issuer={issuer}&digits=6&period=30"
 
 
@@ -1303,7 +1303,7 @@ def test_wecom():
     webhook = decrypt(webhook_enc)
     payload = {
         "msgtype": "text",
-        "text": {"content": f"上游余额监控测试消息\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"},
+        "text": {"content": f"light-metapi 测试消息\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"},
     }
     resp = requests.post(webhook, json=payload, timeout=REQUEST_TIMEOUT)
     if resp.status_code >= 400:

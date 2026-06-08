@@ -1,6 +1,6 @@
-# Upstream Balance Monitor
+# light-metapi
 
-Lightweight balance monitoring for upstream AI relay channels. It currently supports New API and Sub2API, stores channel access tokens after login validation, tracks recharge records from upstream logs, and sends WeCom alerts when balances are low.
+Lightweight upstream balance monitoring for AI relay operators. light-metapi currently supports New API and Sub2API, stores channel access tokens after login validation, tracks recharge records from upstream logs, and sends WeCom alerts when balances are low.
 
 [中文文档](README.zh-CN.md) | [Citation](CITATION.md)
 

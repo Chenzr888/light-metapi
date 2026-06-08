@@ -1,6 +1,6 @@
-# Upstream Balance Monitor
+# light-metapi
 
-轻量上游余额监控工具，当前支持 New API 和 Sub2API。它可以统一维护不同上游渠道的余额、充值记录和企业微信告警，适合 AI API 中转业务做低成本自动巡检。
+light-metapi 是一个轻量上游余额监控工具，当前支持 New API 和 Sub2API。它可以统一维护不同上游渠道的余额、充值记录和企业微信告警，适合 AI API 中转业务做低成本自动巡检。
 
 [English README](README.md) | [引用说明](CITATION.md)
 

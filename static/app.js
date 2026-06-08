@@ -74,7 +74,7 @@ function renderAuth() {
   const form = el("loginForm");
 
   setAuthed(authed);
-  el("loginTitle").textContent = needsSetup ? "创建管理员账号" : "上游额度管理";
+  el("loginTitle").textContent = "light-metapi";
   el("loginCopy").textContent = needsSetup ? "首次打开请创建管理员账号，进入后可选择绑定 2FA。" : "输入管理员账号密码；已绑定 2FA 时填写验证码。";
   el("loginSubmit").textContent = needsSetup ? "创建并进入" : "登录进入";
   el("totpLoginField").classList.toggle("hidden", needsSetup);
