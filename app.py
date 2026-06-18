@@ -577,10 +577,59 @@ def save_channel_credential(channel_id, credential):
         )
 
 
+SUB2API_PROFILE_KEYS = ("user", "profile", "account", "current_user")
+SUB2API_BALANCE_KEYS = (
+    "balance",
+    "quota",
+    "credit",
+    "credits",
+    "remaining_balance",
+    "available_balance",
+    "account_balance",
+    "wallet_balance",
+)
+SUB2API_USED_KEYS = ("used_balance", "used_quota", "quota_used", "used", "total_used")
+
+
 def extract_sub2api_payload(data):
-    if isinstance(data, dict) and isinstance(data.get("data"), dict):
-        return data["data"]
-    return data if isinstance(data, dict) else {}
+    if isinstance(data, dict) and "data" in data:
+        payload = data.get("data")
+        if isinstance(payload, (dict, list)):
+            return payload
+    return data if isinstance(data, (dict, list)) else {}
+
+
+def first_decimal(payload, keys):
+    if not isinstance(payload, dict):
+        return None, None, None
+    for key in keys:
+        if key not in payload:
+            continue
+        value = decimal_from(payload.get(key))
+        if value is not None:
+            return key, value, payload.get(key)
+    return None, None, None
+
+
+def find_sub2api_user_payload(payload):
+    if isinstance(payload, list):
+        for item in payload:
+            found = find_sub2api_user_payload(item)
+            if found:
+                return found
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    if first_decimal(payload, SUB2API_BALANCE_KEYS)[1] is not None:
+        return payload
+    for key in SUB2API_PROFILE_KEYS:
+        nested = payload.get(key)
+        if isinstance(nested, (dict, list)):
+            found = find_sub2api_user_payload(nested)
+            if found:
+                return found
+    return payload
 
 
 def paginated_items(payload):
@@ -625,7 +674,7 @@ def successful_new_api_topup(status):
 
 
 def successful_sub2api_order(status):
-    return str(status or "").upper() == "COMPLETED"
+    return str(status or "").upper() in {"COMPLETED", "PAID", "SUCCESS", "SUCCEEDED"}
 
 
 def sub2api_login(base_url, username, password):
@@ -683,15 +732,36 @@ def sub2api_refresh(base_url, refresh_token):
 
 def sub2api_profile(base_url, access_token):
     session = requests.Session()
-    profile = session.get(
-        urljoin(base_url, "/api/v1/user/profile"),
-        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
-        timeout=REQUEST_TIMEOUT,
-    )
-    profile_data = safe_json(profile)
-    if profile.status_code >= 400:
-        raise RuntimeError(read_message(profile_data) or f"profile 读取失败 HTTP {profile.status_code}")
-    return extract_sub2api_payload(profile_data)
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+    last_error = ""
+    first_payload = None
+    for path in ("/api/v1/user/profile", "/api/v1/auth/me"):
+        resp = session.get(urljoin(base_url, path), headers=headers, timeout=REQUEST_TIMEOUT)
+        data = safe_json(resp)
+        if resp.status_code < 400 and truthy_success(data):
+            payload = extract_sub2api_payload(data)
+            if first_payload is None:
+                first_payload = payload
+            if first_decimal(find_sub2api_user_payload(payload), SUB2API_BALANCE_KEYS)[1] is not None:
+                return payload
+            last_error = f"{path} 响应里没有可识别余额字段"
+            continue
+        last_error = read_message(data) or f"{path} 读取失败 HTTP {resp.status_code}"
+    if first_payload is not None:
+        return first_payload
+    raise RuntimeError(last_error or "profile 读取失败")
+
+
+def safe_sub2api_recharge_logs(base_url, access_token):
+    try:
+        return sub2api_recharge_logs(base_url, access_token)
+    except (requests.RequestException, RuntimeError):
+        return []
+
+
+def sub2api_token_error(exc):
+    message = str(exc).lower()
+    return any(marker in message for marker in ("401", "unauthorized", "unauthenticated", "token", "expired"))
 
 
 def sub2api_recharge_logs(base_url, access_token):
@@ -709,6 +779,8 @@ def sub2api_recharge_logs(base_url, access_token):
         if not isinstance(item, dict) or not successful_sub2api_order(item.get("status")):
             continue
         amount = decimal_from(item.get("amount"))
+        if amount is None:
+            amount = decimal_from(item.get("pay_amount"))
         if amount is None or amount <= 0:
             continue
         detected_at = stable_time(item.get("completed_at") or item.get("paid_at") or item.get("created_at")) or now_iso()
@@ -732,16 +804,21 @@ def sub2api_recharge_logs(base_url, access_token):
 def build_sub2api_result(profile_payload, fallback_user=None):
     if not profile_payload and fallback_user:
         profile_payload = fallback_user
+    profile_payload = find_sub2api_user_payload(profile_payload)
+    if (not profile_payload or first_decimal(profile_payload, SUB2API_BALANCE_KEYS)[1] is None) and fallback_user:
+        profile_payload = find_sub2api_user_payload(fallback_user)
 
-    balance = decimal_from(profile_payload.get("balance"))
+    balance_key, balance, raw_balance = first_decimal(profile_payload, SUB2API_BALANCE_KEYS)
     if balance is None:
-        raise RuntimeError("profile 响应里没有 balance")
+        raise RuntimeError("profile 响应里没有可识别余额字段")
+
+    used_key, used_balance, raw_used_balance = first_decimal(profile_payload, SUB2API_USED_KEYS)
 
     return {
         "balance": balance,
-        "raw_balance": str(profile_payload.get("balance")),
-        "used_balance": None,
-        "raw_used_balance": None,
+        "raw_balance": str(raw_balance),
+        "used_balance": used_balance,
+        "raw_used_balance": str(raw_used_balance) if used_key else None,
         "request_count": None,
         "currency": "USD",
         "status": "ok",
@@ -751,6 +828,8 @@ def build_sub2api_result(profile_payload, fallback_user=None):
             "role": profile_payload.get("role"),
             "concurrency": profile_payload.get("concurrency"),
             "status": profile_payload.get("status"),
+            "balance_field": balance_key,
+            "used_balance_field": used_key,
         },
     }
 
@@ -763,17 +842,16 @@ def fetch_sub2api(channel):
     if credential.get("access_token"):
         try:
             result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]))
-            result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
+            result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
             return result
         except RuntimeError as exc:
-            message = str(exc).lower()
-            if "401" not in message and "unauthorized" not in message:
+            if not sub2api_token_error(exc):
                 raise
             credential = sub2api_refresh(base_url, credential.get("refresh_token"))
             if channel_id:
                 save_channel_credential(channel_id, credential)
             result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]))
-            result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
+            result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
             return result
 
     password_enc = channel_value(channel, "password_enc", "")
@@ -781,7 +859,7 @@ def fetch_sub2api(channel):
         raise RuntimeError("缺少可用令牌，请重新添加渠道")
     credential, user = sub2api_login(base_url, channel["username"], decrypt(password_enc))
     result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]), user)
-    result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
+    result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
     if channel_id:
         save_channel_credential(channel_id, credential)
     return result
@@ -949,7 +1027,7 @@ def provision_channel(platform, base_url, username, password):
     if platform == "sub2api":
         credential, user = sub2api_login(base_url, username, password)
         result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]), user)
-        result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
+        result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
         return credential, result
     raise RuntimeError(f"未知平台: {platform}")
 
