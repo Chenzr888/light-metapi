@@ -124,9 +124,12 @@ async function loadSettings() {
   state.settings = await api("/api/settings");
   el("notifyEnabled").checked = Boolean(state.settings.notify_enabled);
   el("wecomHint").textContent = `每 ${Math.round(state.settings.refresh_interval_seconds / 60)} 分钟探测一次，低于 ${money(state.settings.low_balance_alert_cny, 2)} CNY 自动告警。`;
-  const status = el("wecomStatus");
-  status.textContent = state.settings.wecom_configured ? "已配置" : "未配置";
-  status.className = `pill ${state.settings.wecom_configured ? "ok" : ""}`;
+  const wecomStatus = el("wecomStatus");
+  wecomStatus.textContent = state.settings.wecom_configured ? "已配置" : "未配置";
+  wecomStatus.className = `pill ${state.settings.wecom_configured ? "ok" : ""}`;
+  const feishuStatus = el("feishuStatus");
+  feishuStatus.textContent = state.settings.feishu_configured ? "已配置" : "未配置";
+  feishuStatus.className = `pill ${state.settings.feishu_configured ? "ok" : ""}`;
 }
 
 async function loadChannels() {
@@ -225,6 +228,7 @@ function renderChannels() {
           <button class="btn ghost" type="submit">保存</button>
         </form>
         <div class="card-actions">
+          <a class="btn ghost icon-btn link-btn" href="${escapeAttr(item.recharge_url)}" target="_blank" rel="noopener noreferrer">充值</a>
           <button class="btn icon-btn" data-action="refresh" data-id="${item.id}" type="button">刷新</button>
           <button class="btn danger icon-btn" data-action="delete" data-id="${item.id}" type="button">删除</button>
         </div>
@@ -371,10 +375,12 @@ async function saveSettings(event) {
       method: "PUT",
       body: JSON.stringify({
         wecom_webhook: el("wecomWebhook").value.trim(),
+        feishu_webhook: el("feishuWebhook").value.trim(),
         notify_enabled: el("notifyEnabled").checked,
       }),
     });
     el("wecomWebhook").value = "";
+    el("feishuWebhook").value = "";
     await loadSettings();
     toast("配置已保存");
   } catch (error) {
@@ -400,11 +406,39 @@ async function clearWecom() {
   }
 }
 
+async function clearFeishu() {
+  setBusy(true);
+  try {
+    await api("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({ clear_feishu: true, feishu_webhook: "", notify_enabled: el("notifyEnabled").checked }),
+    });
+    await loadSettings();
+    toast("飞书配置已清空");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function testWecom() {
   setBusy(true);
   try {
     await api("/api/settings/test-wecom", { method: "POST", body: "{}" });
     toast("测试消息已发送");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function testFeishu() {
+  setBusy(true);
+  try {
+    await api("/api/settings/test-feishu", { method: "POST", body: "{}" });
+    toast("飞书测试消息已发送");
   } catch (error) {
     toast(error.message);
   } finally {
@@ -513,7 +547,9 @@ async function boot() {
   el("refreshAllBtn").addEventListener("click", () => refreshAll(false));
   el("notifyBtn").addEventListener("click", () => refreshAll(true));
   el("testWecomBtn").addEventListener("click", testWecom);
+  el("testFeishuBtn").addEventListener("click", testFeishu);
   el("clearWecomBtn").addEventListener("click", clearWecom);
+  el("clearFeishuBtn").addEventListener("click", clearFeishu);
   el("channelList").addEventListener("click", handleListClick);
   el("channelList").addEventListener("submit", handleListSubmit);
 

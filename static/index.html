@@ -47,16 +47,25 @@
         <section class="panel config-panel">
           <div class="panel-head">
             <div>
-              <h2>企业微信</h2>
+              <h2>通知推送</h2>
               <p id="wecomHint">每 5 分钟探测一次，自动推送保持每小时一次。</p>
             </div>
-            <span id="wecomStatus" class="pill">读取中</span>
+            <div class="notify-statuses">
+              <span>企业微信</span>
+              <span id="wecomStatus" class="pill">读取中</span>
+              <span>飞书</span>
+              <span id="feishuStatus" class="pill">读取中</span>
+            </div>
           </div>
 
           <form id="settingsForm" class="form-grid">
             <label>
-              <span>Webhook</span>
+              <span>企业微信 Webhook</span>
               <input id="wecomWebhook" type="password" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." />
+            </label>
+            <label>
+              <span>飞书 Webhook</span>
+              <input id="feishuWebhook" type="password" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
             </label>
             <label class="switch-line">
               <input id="notifyEnabled" type="checkbox" checked />
@@ -64,8 +73,10 @@
             </label>
             <div class="actions">
               <button class="btn primary" type="submit">保存配置</button>
-              <button id="testWecomBtn" class="btn ghost" type="button">发送测试</button>
-              <button id="clearWecomBtn" class="btn danger" type="button">清空</button>
+              <button id="testWecomBtn" class="btn ghost" type="button">测试企业微信</button>
+              <button id="testFeishuBtn" class="btn ghost" type="button">测试飞书</button>
+              <button id="clearWecomBtn" class="btn danger" type="button">清空企业微信</button>
+              <button id="clearFeishuBtn" class="btn danger" type="button">清空飞书</button>
             </div>
           </form>
         </section>

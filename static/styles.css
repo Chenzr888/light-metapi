@@ -137,6 +137,9 @@ h2 {
 }
 
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-height: 38px;
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -144,6 +147,8 @@ h2 {
   background: #fff;
   color: var(--text);
   cursor: pointer;
+  text-decoration: none;
+  white-space: nowrap;
   transition: transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;
 }
 
@@ -229,6 +234,16 @@ select:focus {
   accent-color: var(--brand);
 }
 
+.notify-statuses {
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 8px 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;
@@ -262,7 +277,7 @@ select:focus {
 
 .channel-card {
   display: grid;
-  grid-template-columns: minmax(150px, 1.2fr) 0.72fr 0.78fr 1fr 138px 138px auto;
+  grid-template-columns: minmax(150px, 1.2fr) 0.72fr 0.78fr 1fr 138px 138px minmax(170px, auto);
   align-items: center;
   gap: 12px;
   border: 1px solid var(--line);
@@ -340,6 +355,7 @@ select:focus {
 
 .card-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 

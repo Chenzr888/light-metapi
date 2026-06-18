@@ -237,8 +237,10 @@ def setting_delete(key):
 
 def public_settings():
     webhook_enc = setting_get("wecom_webhook_enc")
+    feishu_webhook_enc = setting_get("feishu_webhook_enc")
     return {
         "wecom_configured": bool(webhook_enc),
+        "feishu_configured": bool(feishu_webhook_enc),
         "notify_enabled": setting_get("notify_enabled", "1") == "1",
         "refresh_interval_seconds": REFRESH_INTERVAL_SECONDS,
         "notify_interval_seconds": NOTIFY_INTERVAL_SECONDS,
@@ -285,6 +287,21 @@ def cny_value(usd_value, cny_rate):
     if usd is None:
         return None
     return as_float(usd * rate_from(cny_rate))
+
+
+def join_url_path(base_url, path):
+    base = normalize_url(base_url)
+    return urljoin(base, path.lstrip("/"))
+
+
+def recharge_url_for(platform, base_url):
+    path = "/purchase" if platform == "sub2api" else "/console/topup"
+    return join_url_path(base_url, path)
+
+
+def recharge_admin_url_for(platform, base_url):
+    path = "/admin/orders" if platform == "sub2api" else "/console/log"
+    return join_url_path(base_url, path)
 
 
 def history_cutoff_iso():
@@ -523,6 +540,8 @@ def row_to_channel(row, include_secret=False):
     item["cny_rate"] = as_float(rate_from(item.get("cny_rate")))
     item["cny_balance"] = cny_value(item.get("balance"), item["cny_rate"])
     item["cny_used_balance"] = cny_value(item.get("used_balance"), item["cny_rate"])
+    item["recharge_url"] = recharge_url_for(item["platform"], item["base_url"])
+    item["recharge_admin_url"] = recharge_admin_url_for(item["platform"], item["base_url"])
     item["history"] = list_balance_history(item["id"])
     item["recharge_logs"] = list_recharge_logs(item["id"], 12)
     if item.get("raw_response"):
@@ -637,7 +656,7 @@ def paginated_items(payload):
         return payload
     if not isinstance(payload, dict):
         return []
-    for key in ("items", "records", "list", "data"):
+    for key in ("items", "records", "list", "rows", "data"):
         value = payload.get(key)
         if isinstance(value, list):
             return value
@@ -673,8 +692,38 @@ def successful_new_api_topup(status):
     return str(status or "").lower() == "success"
 
 
+def successful_new_api_topup_value(item):
+    status = str(item.get("status") or "").lower()
+    if status in {"success", "succeeded", "paid", "completed", "1", "true"}:
+        return True
+    if item.get("status") in (1, True):
+        return True
+    return False
+
+
 def successful_sub2api_order(status):
     return str(status or "").upper() in {"COMPLETED", "PAID", "SUCCESS", "SUCCEEDED"}
+
+
+def first_amount(payload, keys):
+    for key in keys:
+        amount = decimal_from(payload.get(key))
+        if amount is not None:
+            return key, amount
+    return None, None
+
+
+def new_api_topup_amount(base_url, item):
+    key, amount = first_amount(
+        item,
+        ("money", "pay_money", "pay_amount", "actual_amount", "total_amount", "amount"),
+    )
+    if amount is not None:
+        return key, amount
+    quota_key, quota = first_amount(item, ("quota",))
+    if quota is None:
+        return None, None
+    return quota_key, quota / get_new_api_quota_unit(base_url)
 
 
 def sub2api_login(base_url, username, password):
@@ -778,25 +827,26 @@ def sub2api_recharge_logs(base_url, access_token):
     for item in paginated_items(extract_sub2api_payload(data)):
         if not isinstance(item, dict) or not successful_sub2api_order(item.get("status")):
             continue
-        amount = decimal_from(item.get("amount"))
-        if amount is None:
-            amount = decimal_from(item.get("pay_amount"))
+        _, amount = first_amount(item, ("amount", "pay_amount", "actual_amount", "total_amount"))
         if amount is None or amount <= 0:
             continue
-        detected_at = stable_time(item.get("completed_at") or item.get("paid_at") or item.get("created_at")) or now_iso()
+        detected_at = stable_time(
+            item.get("completed_at") or item.get("paid_at") or item.get("updated_at") or item.get("created_at")
+        ) or now_iso()
         logs.append({
             "amount_usd": amount,
             "detected_at": detected_at,
             "source_ref": source_hash(
                 "sub2api",
                 item.get("id"),
+                item.get("out_trade_no"),
                 item.get("created_at"),
                 item.get("completed_at"),
                 item.get("status"),
                 amount,
             ),
             "source_status": item.get("status", ""),
-            "source_type": item.get("payment_type", ""),
+            "source_type": item.get("payment_type") or item.get("provider_key") or item.get("payment_method") or "",
         })
     return logs
 
@@ -942,30 +992,40 @@ def new_api_recharge_logs(base_url, credential, session=None):
     data = safe_json(resp)
     if resp.status_code >= 400 or not truthy_success(data):
         raise RuntimeError(read_message(data) or f"topup 记录读取失败 HTTP {resp.status_code}")
-    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)) else data
     logs = []
     for item in paginated_items(payload):
-        if not isinstance(item, dict) or not successful_new_api_topup(item.get("status")):
+        if not isinstance(item, dict) or not successful_new_api_topup_value(item):
             continue
-        amount = decimal_from(item.get("amount"))
+        _, amount = new_api_topup_amount(base_url, item)
         if amount is None or amount <= 0:
             continue
-        detected_at = stable_time(item.get("complete_time") or item.get("create_time")) or now_iso()
+        detected_at = stable_time(
+            item.get("complete_time") or item.get("completed_at") or item.get("paid_at") or item.get("create_time") or item.get("created_at")
+        ) or now_iso()
         logs.append({
             "amount_usd": amount,
             "detected_at": detected_at,
             "source_ref": source_hash(
                 "new_api",
                 item.get("id"),
+                item.get("trade_no"),
                 item.get("create_time"),
                 item.get("complete_time"),
                 item.get("status"),
                 amount,
             ),
             "source_status": item.get("status", ""),
-            "source_type": item.get("payment_method") or item.get("payment_provider") or "",
+            "source_type": item.get("payment_method") or item.get("payment_provider") or item.get("provider") or "",
         })
     return logs
+
+
+def safe_new_api_recharge_logs(base_url, credential, session=None):
+    try:
+        return new_api_recharge_logs(base_url, credential, session=session)
+    except (requests.RequestException, RuntimeError):
+        return []
 
 
 def build_new_api_result(base_url, payload):
@@ -1002,7 +1062,7 @@ def fetch_new_api(channel):
 
     if credential.get("access_token"):
         result = build_new_api_result(base_url, new_api_self(base_url, credential))
-        result["recharge_logs"] = new_api_recharge_logs(base_url, credential)
+        result["recharge_logs"] = safe_new_api_recharge_logs(base_url, credential)
         return result
 
     password_enc = channel_value(channel, "password_enc", "")
@@ -1011,7 +1071,7 @@ def fetch_new_api(channel):
     session, user = new_api_login(base_url, channel["username"], decrypt(password_enc))
     credential = new_api_generate_token(base_url, session, user.get("id"))
     result = build_new_api_result(base_url, new_api_self(base_url, credential, session=session))
-    result["recharge_logs"] = new_api_recharge_logs(base_url, credential, session=session)
+    result["recharge_logs"] = safe_new_api_recharge_logs(base_url, credential, session=session)
     if channel_id:
         save_channel_credential(channel_id, credential)
     return result
@@ -1022,7 +1082,7 @@ def provision_channel(platform, base_url, username, password):
         session, user = new_api_login(base_url, username, password)
         credential = new_api_generate_token(base_url, session, user.get("id"))
         result = build_new_api_result(base_url, new_api_self(base_url, credential, session=session))
-        result["recharge_logs"] = new_api_recharge_logs(base_url, credential, session=session)
+        result["recharge_logs"] = safe_new_api_recharge_logs(base_url, credential, session=session)
         return credential, result
     if platform == "sub2api":
         credential, user = sub2api_login(base_url, username, password)
@@ -1160,7 +1220,7 @@ def refresh_all(send_notify=False):
                 results.append(row_to_channel(get_channel(row["id"])))
         send_low_balance_alerts(results)
         if send_notify and setting_get("notify_enabled", "1") == "1":
-            send_wecom_summary(results)
+            send_notification_summary(results)
         return results
 
 
@@ -1184,17 +1244,68 @@ def wecom_webhook():
     return decrypt(webhook_enc) if webhook_enc else ""
 
 
+def feishu_webhook():
+    webhook_enc = setting_get("feishu_webhook_enc")
+    return decrypt(webhook_enc) if webhook_enc else ""
+
+
+def notification_webhooks_configured():
+    return bool(wecom_webhook() or feishu_webhook())
+
+
 def post_wecom_text(content):
     webhook = wecom_webhook()
     if not webhook:
         return False
     payload = {"msgtype": "text", "text": {"content": content}}
-    resp = requests.post(webhook, json=payload, timeout=REQUEST_TIMEOUT)
+    try:
+        resp = requests.post(webhook, json=payload, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        return False
     return resp.status_code < 400
 
 
-def send_wecom_summary(channels):
-    if not wecom_webhook():
+def feishu_response_ok(resp):
+    if resp.status_code >= 400:
+        return False
+    data = safe_json(resp)
+    if not isinstance(data, dict):
+        return True
+    code = data.get("code", data.get("StatusCode", 0))
+    return code in (0, "0", None)
+
+
+def post_feishu_text(content):
+    webhook = feishu_webhook()
+    if not webhook:
+        return False
+    payload = {"msg_type": "text", "content": {"text": content}}
+    try:
+        resp = requests.post(webhook, json=payload, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        return False
+    return feishu_response_ok(resp)
+
+
+def post_notification_text(content):
+    sent = []
+    try:
+        wecom_sent = post_wecom_text(content)
+    except requests.RequestException:
+        wecom_sent = False
+    try:
+        feishu_sent = post_feishu_text(content)
+    except requests.RequestException:
+        feishu_sent = False
+    if wecom_sent:
+        sent.append("wecom")
+    if feishu_sent:
+        sent.append("feishu")
+    return sent
+
+
+def send_notification_summary(channels):
+    if not notification_webhooks_configured():
         return False
     ok_count = sum(1 for item in channels if item.get("status") == "ok")
     lines = [
@@ -1211,7 +1322,11 @@ def send_wecom_summary(channels):
         used_text = f", used {format_money(used)}" if used is not None else ""
         message = f" - {item.get('message')}" if item.get("status") != "ok" and item.get("message") else ""
         lines.append(f"{icon} {name}: {balance} {item.get('currency', 'USD')}{used_text}{message}")
-    return post_wecom_text("\n".join(lines))
+    return bool(post_notification_text("\n".join(lines)))
+
+
+def send_wecom_summary(channels):
+    return send_notification_summary(channels)
 
 
 def low_balance_alert_key(channel_id):
@@ -1235,7 +1350,7 @@ def should_send_low_balance_alert(channel):
 
 
 def send_low_balance_alerts(channels):
-    if setting_get("notify_enabled", "1") != "1" or not wecom_webhook():
+    if setting_get("notify_enabled", "1") != "1" or not notification_webhooks_configured():
         return []
     sent = []
     for channel in channels:
@@ -1249,7 +1364,7 @@ def send_low_balance_alerts(channels):
             f"余额: {format_money(channel.get('balance'))} USD / {format_money(channel.get('cny_balance'))} CNY",
             f"阈值: {format_money(as_float(LOW_BALANCE_ALERT_CNY))} CNY",
         ]
-        if post_wecom_text("\n".join(lines)):
+        if post_notification_text("\n".join(lines)):
             setting_set(low_balance_alert_key(channel["id"]), now_iso())
             sent.append(channel)
     return sent
@@ -1367,6 +1482,12 @@ def update_settings():
             setting_set("wecom_webhook_enc", encrypt(webhook))
         elif payload.get("clear_wecom"):
             setting_set("wecom_webhook_enc", "")
+    if "feishu_webhook" in payload:
+        webhook = (payload.get("feishu_webhook") or "").strip()
+        if webhook:
+            setting_set("feishu_webhook_enc", encrypt(webhook))
+        elif payload.get("clear_feishu"):
+            setting_set("feishu_webhook_enc", "")
     if "notify_enabled" in payload:
         setting_set("notify_enabled", "1" if payload.get("notify_enabled") else "0")
     return jsonify({"ok": True, "data": public_settings()})
@@ -1386,6 +1507,23 @@ def test_wecom():
     resp = requests.post(webhook, json=payload, timeout=REQUEST_TIMEOUT)
     if resp.status_code >= 400:
         return response_error(f"企业微信返回 HTTP {resp.status_code}: {resp.text[:300]}", 502)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/settings/test-feishu")
+@login_required
+def test_feishu():
+    webhook_enc = setting_get("feishu_webhook_enc")
+    if not webhook_enc:
+        return response_error("请先保存飞书 webhook")
+    webhook = decrypt(webhook_enc)
+    payload = {
+        "msg_type": "text",
+        "content": {"text": f"light-metapi 测试消息\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"},
+    }
+    resp = requests.post(webhook, json=payload, timeout=REQUEST_TIMEOUT)
+    if not feishu_response_ok(resp):
+        return response_error(f"飞书返回 HTTP {resp.status_code}: {resp.text[:300]}", 502)
     return jsonify({"ok": True})
 
 
