@@ -154,13 +154,18 @@ function setBusy(value) {
   for (const node of document.querySelectorAll("button")) {
     node.disabled = value;
   }
+  for (const node of document.querySelectorAll("a[data-action='recharge']")) {
+    node.classList.toggle("disabled", value);
+  }
   renderAuthControls();
 }
 
 async function loadSettings() {
   state.settings = await api("/api/settings");
   el("notifyEnabled").checked = Boolean(state.settings.notify_enabled);
-  el("wecomHint").textContent = `每 ${Math.round(state.settings.refresh_interval_seconds / 60)} 分钟探测一次，低于 ${money(state.settings.low_balance_alert_cny, 2)} CNY 自动告警。`;
+  const refreshSeconds = Number(state.settings.refresh_interval_seconds || 30);
+  const refreshText = refreshSeconds >= 60 ? `${Math.round(refreshSeconds / 60)} 分钟` : `${refreshSeconds} 秒`;
+  el("wecomHint").textContent = `每 ${refreshText} 探测一次，低于 ${money(state.settings.low_balance_alert_cny, 2)} CNY 自动告警。`;
   const wecomStatus = el("wecomStatus");
   wecomStatus.textContent = state.settings.wecom_configured ? "已配置" : "未配置";
   wecomStatus.className = `pill ${state.settings.wecom_configured ? "ok" : ""}`;
@@ -235,6 +240,10 @@ function renderChannels() {
   list.innerHTML = visibleChannels.map((item) => {
     const statusClass = item.status === "ok" ? "ok" : item.status === "error" ? "error" : "";
     const statusText = item.status === "ok" ? "正常" : item.status === "error" ? "异常" : "待刷新";
+    const rechargeRestricted = Boolean(item.boss_recharge_required);
+    const rechargeAction = rechargeRestricted
+      ? `<button class="btn ghost icon-btn" data-action="boss-recharge" data-id="${item.id}" type="button">充值</button>`
+      : `<a class="btn ghost icon-btn link-btn" data-action="recharge" href="${escapeAttr(item.recharge_url)}" target="_blank" rel="noopener noreferrer">充值</a>`;
     const used = item.used_balance !== null && item.used_balance !== undefined
       ? `<div class="used">已用 ${money(item.cny_used_balance, 2)} CNY / ${money(item.used_balance)} USD</div>`
       : "";
@@ -277,10 +286,14 @@ function renderChannels() {
             <span>阈值</span>
             <input name="alert_cny" type="number" min="0.01" step="0.01" value="${escapeAttr(thresholdCny(item))}" />
           </label>
+          <label class="switch-line boss-switch" title="开启后充值按钮会提示联系老板">
+            <input name="boss_recharge_required" type="checkbox" ${rechargeRestricted ? "checked" : ""} />
+            <span>老板</span>
+          </label>
           <button class="btn ghost" type="submit">保存</button>
         </form>
         <div class="card-actions">
-          <a class="btn ghost icon-btn link-btn" href="${escapeAttr(item.recharge_url)}" target="_blank" rel="noopener noreferrer">充值</a>
+          ${rechargeAction}
           <button class="btn icon-btn" data-action="refresh" data-id="${item.id}" type="button">刷新</button>
           <button class="btn danger icon-btn" data-action="delete" data-id="${item.id}" type="button">删除</button>
         </div>
@@ -408,6 +421,7 @@ async function createChannel(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const payload = Object.fromEntries(new FormData(form).entries());
+  payload.boss_recharge_required = Boolean(form.elements.boss_recharge_required?.checked);
   setBusy(true);
   try {
     await api("/api/channels", { method: "POST", body: JSON.stringify(payload) });
@@ -531,6 +545,7 @@ async function updateRate(form) {
     enabled: channel.enabled,
     cny_rate: form.elements.cny_rate.value,
     alert_cny: form.elements.alert_cny.value,
+    boss_recharge_required: Boolean(form.elements.boss_recharge_required?.checked),
   };
   setBusy(true);
   try {
@@ -549,6 +564,10 @@ async function handleListClick(event) {
   if (!button) return;
   const id = button.dataset.id;
   const action = button.dataset.action;
+  if (action === "boss-recharge") {
+    toast("请联系老板进行充值");
+    return;
+  }
   if (action === "refresh") {
     setBusy(true);
     try {

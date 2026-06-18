@@ -283,7 +283,7 @@ select:focus {
 
 .channel-card {
   display: grid;
-  grid-template-columns: minmax(150px, 1.1fr) minmax(92px, 0.7fr) minmax(92px, 0.72fr) minmax(176px, 1.05fr) 136px minmax(274px, 0.92fr) minmax(168px, auto);
+  grid-template-columns: minmax(150px, 1.1fr) minmax(92px, 0.7fr) minmax(92px, 0.72fr) minmax(176px, 1.05fr) 136px minmax(330px, 0.92fr) minmax(168px, auto);
   align-items: center;
   gap: 12px;
   border: 1px solid var(--line);
@@ -421,13 +421,29 @@ select:focus {
 }
 
 .channel-rate-form {
-  grid-template-columns: minmax(96px, 1fr) minmax(96px, 1fr) auto;
-  min-width: 274px;
+  grid-template-columns: minmax(86px, 1fr) minmax(86px, 1fr) auto auto;
+  min-width: 330px;
 }
 
 .channel-rate-form .btn {
   min-height: 34px;
   padding: 0 12px;
+}
+
+.boss-switch {
+  min-height: 34px;
+  align-self: end;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.boss-switch input {
+  width: 16px;
+  min-height: 16px;
+}
+
+.boss-switch span {
+  font-size: 12px;
 }
 
 .icon-btn {
@@ -533,7 +549,7 @@ select:focus {
   }
 
   .channel-rate-form {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto;
     min-width: 0;
   }
 

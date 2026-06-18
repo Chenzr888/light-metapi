@@ -3,13 +3,14 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import struct
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import wraps
 from pathlib import Path
 from urllib.parse import quote, urljoin
@@ -26,11 +27,12 @@ DB_PATH = DATA_DIR / "upstreams.sqlite3"
 KEY_PATH = DATA_DIR / "secret.key"
 SESSION_KEY_PATH = DATA_DIR / "session.secret"
 STATIC_DIR = ROOT / "static"
-REFRESH_INTERVAL_SECONDS = int(os.getenv("REFRESH_INTERVAL_SECONDS", "300"))
+REFRESH_INTERVAL_SECONDS = int(os.getenv("REFRESH_INTERVAL_SECONDS", "30"))
 NOTIFY_INTERVAL_SECONDS = int(os.getenv("NOTIFY_INTERVAL_SECONDS", "3600"))
 REQUEST_TIMEOUT = int(os.getenv("UPSTREAM_REQUEST_TIMEOUT", "25"))
 HISTORY_RETENTION_HOURS = int(os.getenv("HISTORY_RETENTION_HOURS", "72"))
 DEFAULT_CNY_RATE = Decimal(os.getenv("DEFAULT_CNY_RATE", "7.3"))
+RECHARGE_ROUNDING_UNIT = Decimal(os.getenv("RECHARGE_ROUNDING_UNIT", "100"))
 LOW_BALANCE_ALERT_CNY = Decimal(os.getenv("LOW_BALANCE_ALERT_CNY", "100"))
 LOW_BALANCE_ALERT_COOLDOWN_SECONDS = int(os.getenv("LOW_BALANCE_ALERT_COOLDOWN_SECONDS", "21600"))
 
@@ -121,6 +123,7 @@ def init_db():
         ensure_column(conn, "channels", "credential_enc", "TEXT")
         ensure_column(conn, "channels", "cny_rate", "REAL")
         ensure_column(conn, "channels", "alert_cny", "REAL")
+        ensure_column(conn, "channels", "boss_recharge_required", "INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             """
             UPDATE channels
@@ -261,6 +264,7 @@ def public_settings():
         "notify_interval_seconds": NOTIFY_INTERVAL_SECONDS,
         "history_retention_hours": HISTORY_RETENTION_HOURS,
         "default_cny_rate": as_float(DEFAULT_CNY_RATE),
+        "recharge_rounding_unit": as_float(RECHARGE_ROUNDING_UNIT),
         "low_balance_alert_cny": as_float(LOW_BALANCE_ALERT_CNY),
         "low_balance_alert_cooldown_seconds": LOW_BALANCE_ALERT_COOLDOWN_SECONDS,
     }
@@ -539,6 +543,10 @@ def record_recharge_log(conn, channel_id, log, cny_rate):
     if amount_usd is None or amount_usd <= 0:
         return False
     rate = rate_from(cny_rate)
+    before_balance = decimal_from(log.get("before_balance"))
+    after_balance = decimal_from(log.get("after_balance"))
+    if after_balance is None:
+        after_balance = amount_usd
     detected_at = log.get("detected_at") or now_iso()
     source_ref = log.get("source_ref") or source_hash(channel_id, amount_usd, detected_at, log.get("source_status"))
     conn.execute(
@@ -547,7 +555,7 @@ def record_recharge_log(conn, channel_id, log, cny_rate):
             channel_id, before_balance, after_balance, amount_usd, amount_cny, cny_rate,
             detected_at, source_ref, source_status, source_type, created_at
         )
-        VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(channel_id, source_ref) DO UPDATE SET
             amount_usd = excluded.amount_usd,
             amount_cny = excluded.amount_cny,
@@ -558,7 +566,8 @@ def record_recharge_log(conn, channel_id, log, cny_rate):
         """,
         (
             channel_id,
-            as_float(amount_usd),
+            as_float(before_balance),
+            as_float(after_balance),
             as_float(amount_usd),
             as_float(amount_usd / rate),
             as_float(rate),
@@ -570,6 +579,55 @@ def record_recharge_log(conn, channel_id, log, cny_rate):
         ),
     )
     return True
+
+
+def inferred_recharge_amount(before_balance, after_balance):
+    before = decimal_from(before_balance)
+    after = decimal_from(after_balance)
+    if before is None or after is None or after <= before:
+        return None
+    delta = after - before
+    if RECHARGE_ROUNDING_UNIT <= 0:
+        return delta
+    rounded = (delta / RECHARGE_ROUNDING_UNIT).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * RECHARGE_ROUNDING_UNIT
+    if rounded <= 0:
+        return None
+    return rounded
+
+
+def has_matching_recharge_log(logs, amount, tolerance=Decimal("0.01")):
+    target = decimal_from(amount)
+    if target is None:
+        return False
+    for log in logs or []:
+        logged_amount = decimal_from(log.get("amount_usd"))
+        if logged_amount is not None and abs(logged_amount - target) <= tolerance:
+            return True
+    return False
+
+
+def balance_delta_recharge_log(channel_id, previous_row, result, checked_at):
+    before_balance = channel_value(previous_row, "balance") if previous_row else None
+    after_balance = result.get("balance")
+    amount = inferred_recharge_amount(before_balance, after_balance)
+    if amount is None or has_matching_recharge_log(result.get("recharge_logs") or [], amount):
+        return None
+    return {
+        "before_balance": before_balance,
+        "after_balance": after_balance,
+        "amount_usd": amount,
+        "detected_at": checked_at,
+        "source_ref": source_hash(
+            "balance_delta",
+            channel_id,
+            before_balance,
+            after_balance,
+            checked_at,
+            amount,
+        ),
+        "source_status": "inferred",
+        "source_type": f"balance_delta_nearest_{format_money(as_float(RECHARGE_ROUNDING_UNIT))}",
+    }
 
 
 def sync_recharge_logs(conn, channel, logs):
@@ -591,6 +649,7 @@ def row_to_channel(row, include_secret=False):
     item.pop("password_enc", None)
     item.pop("credential_enc", None)
     item["enabled"] = bool(item["enabled"])
+    item["boss_recharge_required"] = bool(item.get("boss_recharge_required"))
     item["cny_rate"] = as_float(rate_from(item.get("cny_rate")))
     item["alert_cny"] = as_float(alert_threshold_from(item.get("alert_cny")))
     item["cny_balance"] = cny_value(item.get("balance"), item["cny_rate"])
@@ -768,17 +827,103 @@ def first_amount(payload, keys):
     return None, None
 
 
+NEW_API_LOG_TYPE_TOPUP = 1
+NEW_API_LOG_TYPE_MANAGE = 3
+NUMBER_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
+
+
+def new_api_headers(credential):
+    headers = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+    token = credential.get("access_token")
+    user_id = credential.get("user_id")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if user_id:
+        headers["New-Api-User"] = str(user_id)
+    return headers
+
+
 def new_api_topup_amount(base_url, item):
+    quota_key, quota = first_amount(item, ("quota", "amount_quota", "quota_amount"))
+    if quota is not None:
+        return quota_key, quota / get_new_api_quota_unit(base_url)
     key, amount = first_amount(
         item,
         ("money", "pay_money", "pay_amount", "actual_amount", "total_amount", "amount"),
     )
     if amount is not None:
         return key, amount
-    quota_key, quota = first_amount(item, ("quota",))
-    if quota is None:
-        return None, None
-    return quota_key, quota / get_new_api_quota_unit(base_url)
+    return None, None
+
+
+def logged_quota_values(text, quota_unit):
+    quota_unit = quota_unit or Decimal("500000")
+    values = []
+    for match in NUMBER_RE.finditer(str(text or "")):
+        amount = decimal_from(match.group(0).replace(",", ""))
+        if amount is None:
+            continue
+        before = text[max(0, match.start() - 3):match.start()]
+        after = text[match.end():match.end() + 6]
+        if "$" in before or "＄" in before:
+            normalized = amount
+        elif "¥" in before or "￥" in before:
+            normalized = amount / DEFAULT_CNY_RATE
+        elif "点额度" in after or (quota_unit and amount >= quota_unit):
+            normalized = amount / quota_unit
+        else:
+            normalized = amount
+        values.append(normalized)
+    return values
+
+
+def new_api_balance_log_item(base_url, item, quota_unit):
+    content = str(item.get("content") or "")
+    amount = None
+    source_type = ""
+    values = logged_quota_values(content, quota_unit)
+
+    if "通过兑换码充值" in content:
+        amount = values[0] if values else None
+        source_type = "redemption"
+    elif "管理员增加用户额度" in content:
+        amount = values[0] if values else None
+        source_type = "admin_add_quota"
+    elif "管理员覆盖用户额度从" in content and len(values) >= 2:
+        amount = values[1] - values[0]
+        source_type = "admin_set_quota"
+
+    if amount is None or amount <= 0:
+        return None
+
+    detected_at = stable_time(
+        item.get("created_at") or item.get("created_time") or item.get("timestamp") or item.get("time")
+    ) or now_iso()
+    return {
+        "amount_usd": amount,
+        "detected_at": detected_at,
+        "source_ref": source_hash(
+            "new_api_log",
+            item.get("created_at"),
+            item.get("type"),
+            content,
+            amount,
+        ),
+        "source_status": "success",
+        "source_type": source_type,
+    }
+
+
+def unique_recharge_logs(logs):
+    result = []
+    seen = set()
+    for log in logs:
+        key = log.get("source_ref") or source_hash(log.get("amount_usd"), log.get("detected_at"), log.get("source_type"))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(log)
+    return result
 
 
 def sub2api_login(base_url, username, password):
@@ -1009,13 +1154,8 @@ def new_api_generate_token(base_url, session, user_id):
 
 
 def new_api_self(base_url, credential, session=None):
-    token = credential.get("access_token")
+    headers = new_api_headers(credential)
     user_id = credential.get("user_id")
-    headers = {"X-Requested-With": "XMLHttpRequest"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    if user_id:
-        headers["New-Api-User"] = str(user_id)
 
     client = session or requests.Session()
     self_resp = client.get(urljoin(base_url, "/api/user/self"), headers=headers, timeout=REQUEST_TIMEOUT)
@@ -1029,14 +1169,8 @@ def new_api_self(base_url, credential, session=None):
     return self_data.get("data") if isinstance(self_data.get("data"), dict) else {}
 
 
-def new_api_recharge_logs(base_url, credential, session=None):
-    token = credential.get("access_token")
-    user_id = credential.get("user_id")
-    headers = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    if user_id:
-        headers["New-Api-User"] = str(user_id)
+def new_api_topup_logs(base_url, credential, session=None):
+    headers = new_api_headers(credential)
     client = session or requests.Session()
     resp = client.get(
         urljoin(base_url, "/api/user/topup/self"),
@@ -1074,6 +1208,45 @@ def new_api_recharge_logs(base_url, credential, session=None):
             "source_type": item.get("payment_method") or item.get("payment_provider") or item.get("provider") or "",
         })
     return logs
+
+
+def new_api_log_recharge_logs(base_url, credential, session=None):
+    headers = new_api_headers(credential)
+    client = session or requests.Session()
+    quota_unit = None
+    logs = []
+    for log_type in (NEW_API_LOG_TYPE_TOPUP, NEW_API_LOG_TYPE_MANAGE):
+        resp = client.get(
+            urljoin(base_url, "/api/log/self"),
+            params={"p": 1, "page_size": 100, "type": log_type},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        data = safe_json(resp)
+        if resp.status_code >= 400 or not truthy_success(data):
+            raise RuntimeError(read_message(data) or f"log 记录读取失败 HTTP {resp.status_code}")
+        payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)) else data
+        for item in paginated_items(payload):
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("content") or "")
+            if not any(marker in content for marker in ("通过兑换码充值", "管理员增加用户额度", "管理员覆盖用户额度从")):
+                continue
+            if quota_unit is None:
+                quota_unit = get_new_api_quota_unit(base_url)
+            log = new_api_balance_log_item(base_url, item, quota_unit)
+            if log:
+                logs.append(log)
+    return logs
+
+
+def new_api_recharge_logs(base_url, credential, session=None):
+    logs = new_api_topup_logs(base_url, credential, session=session)
+    try:
+        logs.extend(new_api_log_recharge_logs(base_url, credential, session=session))
+    except (requests.RequestException, RuntimeError):
+        pass
+    return unique_recharge_logs(logs)
 
 
 def safe_new_api_recharge_logs(base_url, credential, session=None):
@@ -1195,6 +1368,11 @@ def fetch_channel(channel):
 def persist_result(channel_id, result):
     checked_at = now_iso()
     with db() as conn:
+        previous_row = conn.execute("SELECT * FROM channels WHERE id = ?", (channel_id,)).fetchone()
+        logs = list(result.get("recharge_logs") or [])
+        inferred_log = balance_delta_recharge_log(channel_id, previous_row, result, checked_at)
+        if inferred_log:
+            logs.append(inferred_log)
         conn.execute(
             """
             UPDATE channels
@@ -1228,7 +1406,7 @@ def persist_result(channel_id, result):
         )
         row = conn.execute("SELECT * FROM channels WHERE id = ?", (channel_id,)).fetchone()
         if row:
-            sync_recharge_logs(conn, row, result.get("recharge_logs") or [])
+            sync_recharge_logs(conn, row, logs)
         record_balance_history(conn, channel_id, result, checked_at)
         prune_history(conn)
 
@@ -1608,6 +1786,7 @@ def api_create_channel():
     password = payload.get("password") or ""
     cny_rate = rate_from(payload.get("cny_rate"))
     alert_cny = alert_threshold_from(payload.get("alert_cny"))
+    boss_recharge_required = 1 if payload.get("boss_recharge_required") else 0
     if platform not in ("new_api", "sub2api"):
         return response_error("平台只支持 new_api 或 sub2api")
     if not name:
@@ -1624,10 +1803,10 @@ def api_create_channel():
             """
             INSERT INTO channels(
                 name, platform, base_url, username, password_enc, credential_enc, cny_rate, alert_cny, enabled,
-                balance, raw_balance, used_balance, raw_used_balance, request_count,
+                boss_recharge_required, balance, raw_balance, used_balance, raw_used_balance, request_count,
                 currency, status, message, raw_response, last_checked_at, created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
@@ -1638,6 +1817,7 @@ def api_create_channel():
                 as_float(cny_rate),
                 as_float(alert_cny),
                 1,
+                boss_recharge_required,
                 as_float(result.get("balance")),
                 result.get("raw_balance"),
                 as_float(result.get("used_balance")),
@@ -1674,6 +1854,7 @@ def api_update_channel(channel_id):
     enabled = 1 if payload.get("enabled", row["enabled"]) else 0
     cny_rate = rate_from(payload.get("cny_rate", row["cny_rate"]))
     alert_cny = alert_threshold_from(payload.get("alert_cny"), channel_value(row, "alert_cny"))
+    boss_recharge_required = 1 if payload.get("boss_recharge_required", channel_value(row, "boss_recharge_required", 0)) else 0
     if platform not in ("new_api", "sub2api"):
         return response_error("平台只支持 new_api 或 sub2api")
     password = payload.get("password") or ""
@@ -1700,6 +1881,7 @@ def api_update_channel(channel_id):
                     cny_rate = ?,
                     alert_cny = ?,
                     enabled = ?,
+                    boss_recharge_required = ?,
                     balance = ?,
                     raw_balance = ?,
                     used_balance = ?,
@@ -1722,6 +1904,7 @@ def api_update_channel(channel_id):
                     as_float(cny_rate),
                     as_float(alert_cny),
                     enabled,
+                    boss_recharge_required,
                     as_float(result.get("balance")),
                     result.get("raw_balance"),
                     as_float(result.get("used_balance")),
@@ -1754,10 +1937,23 @@ def api_update_channel(channel_id):
                     cny_rate = ?,
                     alert_cny = ?,
                     enabled = ?,
+                    boss_recharge_required = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (name, platform, base_url, username, credential_enc, as_float(cny_rate), as_float(alert_cny), enabled, ts, channel_id),
+                (
+                    name,
+                    platform,
+                    base_url,
+                    username,
+                    credential_enc,
+                    as_float(cny_rate),
+                    as_float(alert_cny),
+                    enabled,
+                    boss_recharge_required,
+                    ts,
+                    channel_id,
+                ),
             )
     return jsonify({"ok": True, "data": row_to_channel(get_channel(channel_id))})
 

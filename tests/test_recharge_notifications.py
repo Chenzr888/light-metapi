@@ -28,6 +28,20 @@ class FakeSession:
         return self.response
 
 
+class RouteSession:
+    def __init__(self, routes):
+        self.routes = routes
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        params = kwargs.get("params") or {}
+        key = (url, params.get("type"))
+        if key in self.routes:
+            return self.routes[key]
+        return self.routes[url]
+
+
 class RechargeAndNotificationTest(unittest.TestCase):
     def test_session_cookie_uses_app_specific_name(self):
         self.assertEqual(app.app.config["SESSION_COOKIE_NAME"], "ub_admin_session")
@@ -95,6 +109,25 @@ class RechargeAndNotificationTest(unittest.TestCase):
         item = app.row_to_channel(row)
         self.assertEqual(str(item["alert_cny"]), "88.0")
         self.assertAlmostEqual(item["cny_balance"], 100 / 7.3)
+        self.assertFalse(item["boss_recharge_required"])
+
+    def test_channel_rows_expose_boss_recharge_flag(self):
+        with app.db() as conn:
+            ts = app.now_iso()
+            cur = conn.execute(
+                """
+                INSERT INTO channels(
+                    name, platform, base_url, username, password_enc, credential_enc, cny_rate, alert_cny,
+                    boss_recharge_required, enabled, balance, raw_balance, used_balance, raw_used_balance, request_count,
+                    currency, status, message, raw_response, last_checked_at, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, '', '', ?, ?, 1, 1, ?, ?, NULL, NULL, NULL, 'USD', 'ok', '', '{}', ?, ?, ?)
+                """,
+                ("boss-demo", "new_api", "https://example.com/", "u", 7.3, 88, 100, "100", None, ts, ts),
+            )
+            row = conn.execute("SELECT * FROM channels WHERE id = ?", (cur.lastrowid,)).fetchone()
+        item = app.row_to_channel(row)
+        self.assertTrue(item["boss_recharge_required"])
 
     def test_cny_value_uses_usd_per_cny_ratio(self):
         self.assertEqual(app.cny_value(3000, 10), 300.0)
@@ -158,6 +191,80 @@ class RechargeAndNotificationTest(unittest.TestCase):
             )
 
         self.assertEqual(str(logs[0]["amount_usd"]), "2")
+
+    def test_new_api_recharge_logs_parse_redeem_and_admin_balance_logs(self):
+        base_url = "https://example.com/"
+        session = RouteSession({
+            "https://example.com/api/user/topup/self": FakeResponse({"success": True, "data": {"items": []}}),
+            ("https://example.com/api/log/self", app.NEW_API_LOG_TYPE_TOPUP): FakeResponse({
+                "success": True,
+                "data": {
+                    "items": [
+                        {
+                            "created_at": 1710000000,
+                            "type": app.NEW_API_LOG_TYPE_TOPUP,
+                            "content": "通过兑换码充值 ＄5.000000 额度，兑换码ID 12",
+                        }
+                    ]
+                },
+            }),
+            ("https://example.com/api/log/self", app.NEW_API_LOG_TYPE_MANAGE): FakeResponse({
+                "success": True,
+                "data": {
+                    "items": [
+                        {
+                            "created_at": 1710000010,
+                            "type": app.NEW_API_LOG_TYPE_MANAGE,
+                            "content": "管理员增加用户额度 ＄10.000000 额度",
+                        },
+                        {
+                            "created_at": 1710000020,
+                            "type": app.NEW_API_LOG_TYPE_MANAGE,
+                            "content": "管理员覆盖用户额度从 ＄1.000000 额度 为 ＄3.500000 额度",
+                        },
+                        {
+                            "created_at": 1710000030,
+                            "type": app.NEW_API_LOG_TYPE_MANAGE,
+                            "content": "管理员减少用户额度 ＄2.000000 额度",
+                        },
+                    ]
+                },
+            }),
+        })
+
+        logs = app.new_api_recharge_logs(
+            base_url,
+            {"access_token": "token", "user_id": 7},
+            session=session,
+        )
+
+        self.assertEqual([log["source_type"] for log in logs], ["redemption", "admin_add_quota", "admin_set_quota"])
+        self.assertEqual([str(log["amount_usd"]) for log in logs], ["5.000000", "10.000000", "2.500000"])
+        self.assertEqual(session.calls[1][1]["params"]["type"], app.NEW_API_LOG_TYPE_TOPUP)
+        self.assertEqual(session.calls[2][1]["params"]["type"], app.NEW_API_LOG_TYPE_MANAGE)
+
+    def test_logged_quota_values_convert_tokens_to_usd(self):
+        values = app.logged_quota_values("通过兑换码充值 1000000 点额度，兑换码ID 7", app.Decimal("500000"))
+        self.assertEqual(str(values[0]), "2")
+
+    def test_balance_delta_recharge_rounds_to_nearest_hundred(self):
+        previous = {"balance": "832"}
+        result = {"balance": app.Decimal("1323.2"), "recharge_logs": []}
+        log = app.balance_delta_recharge_log(8, previous, result, "2026-06-19T00:00:00+00:00")
+
+        self.assertEqual(str(log["amount_usd"]), "500")
+        self.assertEqual(log["before_balance"], "832")
+        self.assertEqual(log["after_balance"], app.Decimal("1323.2"))
+        self.assertEqual(log["source_status"], "inferred")
+
+    def test_balance_delta_recharge_skips_when_upstream_log_matches(self):
+        previous = {"balance": "832"}
+        result = {
+            "balance": app.Decimal("1323.2"),
+            "recharge_logs": [{"amount_usd": app.Decimal("500")}],
+        }
+
+        self.assertIsNone(app.balance_delta_recharge_log(8, previous, result, "2026-06-19T00:00:00+00:00"))
 
     def test_safe_new_api_recharge_logs_returns_empty_on_failure(self):
         with patch("app.new_api_recharge_logs", side_effect=RuntimeError("topup failed")):
