@@ -17,7 +17,6 @@ from urllib.parse import quote, urljoin
 import requests
 from cryptography.fernet import Fernet
 from flask import Flask, jsonify, request, send_from_directory, session
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -47,7 +46,8 @@ def read_or_create_secret(path, size=32):
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="")
 app.config.update(
     SECRET_KEY=read_or_create_secret(SESSION_KEY_PATH),
-    SESSION_COOKIE_NAME="upstream_balance_session",
+    SESSION_COOKIE_NAME=os.getenv("SESSION_COOKIE_NAME", "ub_admin_session"),
+    SESSION_COOKIE_PATH=os.getenv("SESSION_COOKIE_PATH", "/"),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
@@ -337,12 +337,6 @@ def response_error(message, status=400):
     return jsonify({"ok": False, "message": message}), status
 
 
-@app.after_request
-def clear_cookie_session(response):
-    response.delete_cookie(app.config["SESSION_COOKIE_NAME"], path="/")
-    return response
-
-
 def request_payload(force=False):
     encoded = request.headers.get("X-UB-Payload")
     if encoded:
@@ -369,50 +363,29 @@ def get_user(user_id):
         return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
-def auth_serializer():
-    return URLSafeTimedSerializer(app.config["SECRET_KEY"], salt="upstream-balance-auth")
+def setup_login(user):
+    session.permanent = True
+    session["id"] = user["id"]
+    session["username"] = user["username"]
+    session["totp_enabled"] = bool(user["totp_enabled"])
 
 
-def auth_token_fingerprint(user):
-    return hashlib.sha256(user["password_hash"].encode("utf-8")).hexdigest()[:16]
+def clear_login():
+    session.clear()
 
 
-def issue_auth_token(user):
-    return auth_serializer().dumps({"uid": user["id"], "fp": auth_token_fingerprint(user)})
-
-
-def request_auth_token():
-    token = (request.headers.get("X-UB-Auth") or "").strip()
-    if token:
-        return token
-    auth_header = (request.headers.get("Authorization") or "").strip()
-    if auth_header.lower().startswith("bearer "):
-        return auth_header[7:].strip()
-    payload_token = (request_payload().get("auth_token") or "").strip()
-    if payload_token:
-        return payload_token
-    return ""
-
-
-def user_from_auth_token(token):
-    if not token:
+def current_user():
+    user_id = session.get("id")
+    if not user_id:
         return None
-    max_age = int(app.config["PERMANENT_SESSION_LIFETIME"].total_seconds())
-    try:
-        payload = auth_serializer().loads(token, max_age=max_age)
-    except (BadSignature, SignatureExpired, TypeError, ValueError):
-        return None
-    user = get_user(payload.get("uid"))
-    if not user or payload.get("fp") != auth_token_fingerprint(user):
+    user = get_user(user_id)
+    if not user:
+        clear_login()
         return None
     return user
 
 
-def current_user():
-    return user_from_auth_token(request_auth_token())
-
-
-def auth_state(user=None, include_token=False):
+def auth_state(user=None):
     active_user = user if user is not None else current_user()
     state = {
         "needs_setup": user_count() == 0,
@@ -420,8 +393,6 @@ def auth_state(user=None, include_token=False):
         "username": active_user["username"] if active_user else "",
         "totp_enabled": bool(active_user["totp_enabled"]) if active_user else False,
     }
-    if include_token and active_user:
-        state["auth_token"] = issue_auth_token(active_user)
     return state
 
 
@@ -1487,7 +1458,9 @@ def auth_register():
             "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
             (username, generate_password_hash(password), ts, ts),
         )
-    return jsonify({"ok": True, "data": auth_state(get_user(cur.lastrowid), include_token=True)})
+    user = get_user(cur.lastrowid)
+    setup_login(user)
+    return jsonify({"ok": True, "data": auth_state(user)})
 
 
 @app.post("/api/auth/login")
@@ -1500,12 +1473,13 @@ def auth_login():
         return response_error("账号或密码错误", 401)
     if row["totp_enabled"] and not verify_totp(row["totp_secret"], payload.get("totp")):
         return response_error("2FA 验证码错误", 401)
-    return jsonify({"ok": True, "data": auth_state(row, include_token=True)})
+    setup_login(row)
+    return jsonify({"ok": True, "data": auth_state(row)})
 
 
 @app.post("/api/auth/logout")
 def auth_logout():
-    session.clear()
+    clear_login()
     return jsonify({"ok": True})
 
 
@@ -1530,7 +1504,9 @@ def auth_2fa_confirm():
         return response_error("2FA 验证码错误", 401)
     with db() as conn:
         conn.execute("UPDATE users SET totp_enabled = 1, updated_at = ? WHERE id = ?", (now_iso(), row["id"]))
-    return jsonify({"ok": True, "data": auth_state()})
+    updated = get_user(row["id"])
+    setup_login(updated)
+    return jsonify({"ok": True, "data": auth_state(updated)})
 
 
 @app.post("/api/auth/2fa/disable")

@@ -1,5 +1,3 @@
-import base64
-import json
 import unittest
 import uuid
 from unittest.mock import Mock, patch
@@ -32,24 +30,47 @@ class FakeSession:
 
 class RechargeAndNotificationTest(unittest.TestCase):
     def test_session_cookie_uses_app_specific_name(self):
-        self.assertEqual(app.app.config["SESSION_COOKIE_NAME"], "upstream_balance_session")
+        self.assertEqual(app.app.config["SESSION_COOKIE_NAME"], "ub_admin_session")
 
-    def test_auth_token_required_for_protected_routes(self):
+    def test_login_sets_scoped_http_only_session_cookie(self):
         ts = app.now_iso()
-        username = f"token-user-{uuid.uuid4().hex}"
+        username = f"cookie-user-{uuid.uuid4().hex}"
+        with app.db() as conn:
+            conn.execute(
+                "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
+                (username, generate_password_hash("secret123"), ts, ts),
+            )
+        old_path = app.app.config["SESSION_COOKIE_PATH"]
+        app.app.config["SESSION_COOKIE_PATH"] = "/upstream-balance"
+        try:
+            with app.app.test_client() as client:
+                response = client.post("/api/auth/login", json={"username": username, "password": "secret123"})
+        finally:
+            app.app.config["SESSION_COOKIE_PATH"] = old_path
+        cookie = response.headers.get("Set-Cookie", "")
+        self.assertIn("ub_admin_session=", cookie)
+        self.assertIn("Path=/upstream-balance", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Lax", cookie)
+
+    def test_session_login_required_for_protected_routes(self):
+        ts = app.now_iso()
+        username = f"session-user-{uuid.uuid4().hex}"
         with app.db() as conn:
             cur = conn.execute(
                 "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
                 (username, generate_password_hash("secret123"), ts, ts),
             )
             user = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
-        token = app.issue_auth_token(user)
         with app.app.test_client() as client:
             self.assertEqual(client.get("/api/channels").status_code, 401)
             self.assertEqual(client.get("/api/channels", headers={"Cookie": "session=invalid"}).status_code, 401)
-            self.assertEqual(client.get("/api/channels", headers={"X-UB-Auth": token}).status_code, 200)
-            payload_token = base64.urlsafe_b64encode(json.dumps({"auth_token": token}).encode()).decode()
-            self.assertEqual(client.get("/api/channels", headers={"X-UB-Payload": payload_token}).status_code, 200)
+            self.assertEqual(client.get("/api/channels", headers={"X-UB-Auth": "legacy-token"}).status_code, 401)
+            with client.session_transaction() as sess:
+                sess["id"] = user["id"]
+                sess["username"] = user["username"]
+                sess["totp_enabled"] = False
+            self.assertEqual(client.get("/api/channels").status_code, 200)
 
     def test_alert_threshold_uses_channel_value_then_default(self):
         self.assertEqual(str(app.alert_threshold_from("15")), "15")

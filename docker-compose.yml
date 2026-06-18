@@ -12,6 +12,8 @@ services:
       LOW_BALANCE_ALERT_CNY: 100
       LOW_BALANCE_ALERT_COOLDOWN_SECONDS: 21600
       UPSTREAM_REQUEST_TIMEOUT: 25
+      SESSION_COOKIE_NAME: ub_admin_session
+      SESSION_COOKIE_PATH: /upstream-balance
     ports:
       - "127.0.0.1:8756:8756"
     volumes:

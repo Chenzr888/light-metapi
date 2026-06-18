@@ -3,7 +3,6 @@ const state = {
   recharges: [],
   settings: null,
   auth: null,
-  authToken: window.localStorage.getItem("upstreamBalanceAuth") || "",
   busy: false,
   channelFilter: "all",
 };
@@ -13,21 +12,6 @@ const el = (id) => document.getElementById(id);
 
 function encodePayload(value) {
   return btoa(unescape(encodeURIComponent(value)));
-}
-
-function attachAuthTokenToBody(body) {
-  if (!state.authToken) return body;
-  let payload = {};
-  if (body) {
-    try {
-      payload = JSON.parse(body);
-    } catch {
-      return body;
-    }
-  }
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return body;
-  payload.auth_token = state.authToken;
-  return JSON.stringify(payload);
 }
 
 function money(value, digits = 4) {
@@ -123,18 +107,9 @@ async function api(path, options = {}) {
   const publicPath = path.startsWith("/api/") ? `/_ub_api/${path.slice(5)}` : path;
   const target = `${apiBase}${publicPath}`;
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-  if (state.authToken) {
-    headers["X-UB-Auth"] = state.authToken;
-  }
   const requestOptions = { ...options };
   if (publicPath.startsWith("/_ub_api/")) {
     const method = (requestOptions.method || "GET").toUpperCase();
-    if (state.authToken) {
-      requestOptions.body = attachAuthTokenToBody(requestOptions.body);
-      if (!requestOptions.body) {
-        headers["X-UB-Payload"] = encodePayload(JSON.stringify({ auth_token: state.authToken }));
-      }
-    }
     if (method !== "GET") {
       headers["X-UB-Method"] = method;
       if (requestOptions.body) {
@@ -153,8 +128,7 @@ async function api(path, options = {}) {
   if (!res.ok || data.ok === false) {
     if (res.status === 401) {
       state.auth = { needs_setup: false, authenticated: false, username: "", totp_enabled: false };
-      state.authToken = "";
-      window.localStorage.removeItem("upstreamBalanceAuth");
+      window.localStorage.removeItem("upstreamBalanceUser");
       renderAuth();
     }
     throw new Error(data.message || `请求失败 ${res.status}`);
@@ -170,13 +144,9 @@ async function loadAuth() {
 
 function storeAuth(data) {
   state.auth = data;
-  state.authToken = data.auth_token || "";
-  if (state.authToken) {
-    window.localStorage.setItem("upstreamBalanceAuth", state.authToken);
-  } else {
-    window.localStorage.removeItem("upstreamBalanceAuth");
+  if (state.auth) {
+    window.localStorage.setItem("upstreamBalanceUser", JSON.stringify(state.auth));
   }
-  delete state.auth.auth_token;
 }
 
 function setBusy(value) {
@@ -385,8 +355,8 @@ async function logout() {
   setBusy(true);
   try {
     await api("/api/auth/logout", { method: "POST", body: "{}" });
-    state.authToken = "";
     window.localStorage.removeItem("upstreamBalanceAuth");
+    window.localStorage.removeItem("upstreamBalanceUser");
     await loadAuth();
     el("loginForm").reset();
     toast("已退出");
@@ -418,10 +388,11 @@ async function confirmTwofa(event) {
   const payload = Object.fromEntries(new FormData(form).entries());
   setBusy(true);
   try {
-    state.auth = await api("/api/auth/2fa/confirm", {
+    const data = await api("/api/auth/2fa/confirm", {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    storeAuth(data);
     form.reset();
     el("twofaPanel").classList.add("hidden");
     renderAuth();
