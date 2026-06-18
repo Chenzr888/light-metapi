@@ -277,25 +277,27 @@ function renderChannels() {
           ${sparkline(item.history)}
           <div class="meta">${(item.history || []).length} 点 / 72h</div>
         </div>
-        <form class="rate-form channel-rate-form" data-id="${item.id}">
-          <label>
-            <span>比例</span>
-            <input name="cny_rate" type="number" min="0.0001" step="0.0001" value="${escapeAttr(item.cny_rate || 7.3)}" />
-          </label>
-          <label>
-            <span>阈值</span>
-            <input name="alert_cny" type="number" min="0.01" step="0.01" value="${escapeAttr(thresholdCny(item))}" />
-          </label>
-          <label class="switch-line boss-switch" title="开启后充值按钮会提示联系老板">
-            <input name="boss_recharge_required" type="checkbox" ${rechargeRestricted ? "checked" : ""} />
-            <span>老板</span>
-          </label>
-          <button class="btn ghost" type="submit">保存</button>
-        </form>
-        <div class="card-actions">
-          ${rechargeAction}
-          <button class="btn icon-btn" data-action="refresh" data-id="${item.id}" type="button">刷新</button>
-          <button class="btn danger icon-btn" data-action="delete" data-id="${item.id}" type="button">删除</button>
+        <div class="channel-controls">
+          <form class="rate-form channel-rate-form" data-id="${item.id}">
+            <label>
+              <span>比例</span>
+              <input name="cny_rate" type="number" min="0.0001" step="0.0001" value="${escapeAttr(item.cny_rate || 7.3)}" />
+            </label>
+            <label>
+              <span>阈值</span>
+              <input name="alert_cny" type="number" min="0.01" step="0.01" value="${escapeAttr(thresholdCny(item))}" />
+            </label>
+            <label class="switch-line boss-switch" title="开启后充值按钮会提示联系老板">
+              <input name="boss_recharge_required" type="checkbox" ${rechargeRestricted ? "checked" : ""} />
+              <span>老板</span>
+            </label>
+            <button class="btn ghost" type="submit">保存</button>
+          </form>
+          <div class="card-actions">
+            ${rechargeAction}
+            <button class="btn icon-btn" data-action="refresh" data-id="${item.id}" type="button">刷新</button>
+            <button class="btn danger icon-btn" data-action="delete" data-id="${item.id}" type="button">删除</button>
+          </div>
         </div>
       </article>
     `;

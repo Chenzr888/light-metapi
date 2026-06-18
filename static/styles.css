@@ -283,7 +283,7 @@ select:focus {
 
 .channel-card {
   display: grid;
-  grid-template-columns: minmax(150px, 1.1fr) minmax(92px, 0.7fr) minmax(92px, 0.72fr) minmax(176px, 1.05fr) 136px minmax(330px, 0.92fr) minmax(168px, auto);
+  grid-template-columns: minmax(170px, 1fr) minmax(120px, 0.72fr) minmax(110px, 0.66fr) minmax(200px, 1fr) minmax(150px, 0.72fr) minmax(420px, 1.25fr);
   align-items: center;
   gap: 12px;
   border: 1px solid var(--line);
@@ -378,12 +378,6 @@ select:focus {
   color: var(--brand-strong);
 }
 
-.card-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
 .trend-cell {
   min-width: 0;
 }
@@ -420,14 +414,31 @@ select:focus {
   padding: 0 8px;
 }
 
+.channel-controls {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
 .channel-rate-form {
-  grid-template-columns: minmax(86px, 1fr) minmax(86px, 1fr) auto auto;
-  min-width: 330px;
+  grid-template-columns: minmax(110px, 1fr) minmax(110px, 1fr) auto auto;
+  align-items: end;
+  min-width: 0;
 }
 
 .channel-rate-form .btn {
   min-height: 34px;
   padding: 0 12px;
+}
+
+.card-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.card-actions .btn {
+  width: 100%;
 }
 
 .boss-switch {
@@ -544,17 +555,13 @@ select:focus {
   }
 
   .rate-form,
+  .channel-controls,
   .card-actions {
     width: 100%;
   }
 
   .channel-rate-form {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto;
-    min-width: 0;
-  }
-
-  .card-actions .btn {
-    flex: 1;
   }
 
   .recharge-row {
@@ -573,8 +580,13 @@ select:focus {
     grid-template-columns: 1fr 1fr;
   }
 
+  .boss-switch,
   .channel-rate-form .btn {
     grid-column: 1 / -1;
+  }
+
+  .card-actions {
+    grid-template-columns: 1fr;
   }
 
   .two-col {
