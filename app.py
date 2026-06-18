@@ -312,6 +312,17 @@ def response_error(message, status=400):
     return jsonify({"ok": False, "message": message}), status
 
 
+def request_payload(force=False):
+    encoded = request.headers.get("X-UB-Payload")
+    if encoded:
+        try:
+            raw = base64.urlsafe_b64decode(encoded.encode("ascii"))
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, json.JSONDecodeError):
+            return {}
+    return request.get_json(force=force, silent=True) or {}
+
+
 def user_count():
     with db() as conn:
         return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -1389,7 +1400,7 @@ def auth_bootstrap():
 def auth_register():
     if user_count() > 0:
         return response_error("管理员账号已创建", 403)
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
     if len(username) < 3:
@@ -1410,7 +1421,7 @@ def auth_register():
 
 @app.post("/api/auth/login")
 def auth_login():
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
     row = get_user_by_username(username)
@@ -1446,7 +1457,7 @@ def auth_2fa_confirm():
     row = current_user()
     if not row["totp_secret"]:
         return response_error("请先生成 2FA 密钥")
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     if not verify_totp(row["totp_secret"], payload.get("totp")):
         return response_error("2FA 验证码错误", 401)
     with db() as conn:
@@ -1458,7 +1469,7 @@ def auth_2fa_confirm():
 @login_required
 def auth_2fa_disable():
     row = current_user()
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     if not check_password_hash(row["password_hash"], payload.get("password") or ""):
         return response_error("密码错误", 401)
     with db() as conn:
@@ -1475,7 +1486,7 @@ def get_settings():
 @app.put("/api/settings")
 @login_required
 def update_settings():
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     if "wecom_webhook" in payload:
         webhook = (payload.get("wecom_webhook") or "").strip()
         if webhook:
@@ -1545,7 +1556,7 @@ def api_recharge_logs():
 @app.post("/api/channels")
 @login_required
 def api_create_channel():
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     name = (payload.get("name") or "").strip()
     platform = (payload.get("platform") or "").strip()
     base_url = normalize_url(payload.get("base_url"))
@@ -1609,7 +1620,7 @@ def api_update_channel(channel_id):
     row = get_channel(channel_id)
     if not row:
         return response_error("渠道不存在", 404)
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     name = (payload.get("name") or row["name"]).strip()
     platform = (payload.get("platform") or row["platform"]).strip()
     base_url = normalize_url(payload.get("base_url") or row["base_url"])
@@ -1722,9 +1733,22 @@ def api_refresh_channel(channel_id):
 @app.post("/api/refresh")
 @login_required
 def api_refresh_all():
-    payload = request.get_json(silent=True) or {}
+    payload = request_payload()
     data = refresh_all(send_notify=bool(payload.get("notify")))
     return jsonify({"ok": True, "data": data})
+
+
+def register_api_aliases():
+    for rule in list(app.url_map.iter_rules()):
+        if not rule.rule.startswith("/api/"):
+            continue
+        alias = "/_ub_api/" + rule.rule[len("/api/"):]
+        endpoint = f"ub_alias_{rule.endpoint}"
+        if endpoint in app.view_functions:
+            continue
+        methods = set(rule.methods)
+        methods.add("GET")
+        app.add_url_rule(alias, endpoint, app.view_functions[rule.endpoint], methods=methods)
 
 
 def scheduler_loop():
@@ -1746,6 +1770,7 @@ def start_scheduler():
 
 
 init_db()
+register_api_aliases()
 start_scheduler()
 
 

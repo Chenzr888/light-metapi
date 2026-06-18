@@ -88,10 +88,20 @@ function renderAuth() {
 }
 
 async function api(path, options = {}) {
-  const target = `${apiBase}${path}`;
+  const publicPath = path.startsWith("/api/") ? `/_ub_api/${path.slice(5)}` : path;
+  const target = `${apiBase}${publicPath}`;
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  const requestOptions = { ...options };
+  if (publicPath.startsWith("/_ub_api/") && requestOptions.method && requestOptions.method.toUpperCase() !== "GET") {
+    headers["X-UB-Method"] = requestOptions.method.toUpperCase();
+    if (requestOptions.body) {
+      headers["X-UB-Payload"] = btoa(unescape(encodeURIComponent(requestOptions.body)));
+    }
+    requestOptions.method = "GET";
+    delete requestOptions.body;
+  }
   const res = await fetch(target, {
-    ...options,
+    ...requestOptions,
     credentials: "same-origin",
     headers,
   });
