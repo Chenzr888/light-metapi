@@ -283,7 +283,7 @@ select:focus {
 
 .channel-card {
   display: grid;
-  grid-template-columns: minmax(150px, 1.1fr) 0.7fr 0.72fr 1.05fr 126px 172px minmax(180px, auto);
+  grid-template-columns: minmax(150px, 1.1fr) minmax(92px, 0.7fr) minmax(92px, 0.72fr) minmax(176px, 1.05fr) 136px minmax(274px, 0.92fr) minmax(168px, auto);
   align-items: center;
   gap: 12px;
   border: 1px solid var(--line);
@@ -420,6 +420,16 @@ select:focus {
   padding: 0 8px;
 }
 
+.channel-rate-form {
+  grid-template-columns: minmax(96px, 1fr) minmax(96px, 1fr) auto;
+  min-width: 274px;
+}
+
+.channel-rate-form .btn {
+  min-height: 34px;
+  padding: 0 12px;
+}
+
 .icon-btn {
   min-width: 36px;
   min-height: 34px;
@@ -522,6 +532,11 @@ select:focus {
     width: 100%;
   }
 
+  .channel-rate-form {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+    min-width: 0;
+  }
+
   .card-actions .btn {
     flex: 1;
   }
@@ -536,6 +551,14 @@ select:focus {
   .app-shell {
     width: min(100vw - 20px, 1240px);
     padding-top: 18px;
+  }
+
+  .channel-rate-form {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .channel-rate-form .btn {
+    grid-column: 1 / -1;
   }
 
   .two-col {

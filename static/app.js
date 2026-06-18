@@ -268,7 +268,7 @@ function renderChannels() {
           ${sparkline(item.history)}
           <div class="meta">${(item.history || []).length} 点 / 72h</div>
         </div>
-        <form class="rate-form" data-id="${item.id}">
+        <form class="rate-form channel-rate-form" data-id="${item.id}">
           <label>
             <span>比例</span>
             <input name="cny_rate" type="number" min="0.0001" step="0.0001" value="${escapeAttr(item.cny_rate || 7.3)}" />
