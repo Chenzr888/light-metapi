@@ -11,6 +11,25 @@ const state = {
 const apiBase = new URL(".", window.location.href).pathname.replace(/\/$/, "");
 const el = (id) => document.getElementById(id);
 
+function encodePayload(value) {
+  return btoa(unescape(encodeURIComponent(value)));
+}
+
+function attachAuthTokenToBody(body) {
+  if (!state.authToken) return body;
+  let payload = {};
+  if (body) {
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      return body;
+    }
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return body;
+  payload.auth_token = state.authToken;
+  return JSON.stringify(payload);
+}
+
 function money(value, digits = 4) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
   return Number(value).toLocaleString(undefined, {
@@ -108,13 +127,22 @@ async function api(path, options = {}) {
     headers["X-UB-Auth"] = state.authToken;
   }
   const requestOptions = { ...options };
-  if (publicPath.startsWith("/_ub_api/") && requestOptions.method && requestOptions.method.toUpperCase() !== "GET") {
-    headers["X-UB-Method"] = requestOptions.method.toUpperCase();
-    if (requestOptions.body) {
-      headers["X-UB-Payload"] = btoa(unescape(encodeURIComponent(requestOptions.body)));
+  if (publicPath.startsWith("/_ub_api/")) {
+    const method = (requestOptions.method || "GET").toUpperCase();
+    if (state.authToken) {
+      requestOptions.body = attachAuthTokenToBody(requestOptions.body);
+      if (!requestOptions.body) {
+        headers["X-UB-Payload"] = encodePayload(JSON.stringify({ auth_token: state.authToken }));
+      }
     }
-    requestOptions.method = "GET";
-    delete requestOptions.body;
+    if (method !== "GET") {
+      headers["X-UB-Method"] = method;
+      if (requestOptions.body) {
+        headers["X-UB-Payload"] = encodePayload(requestOptions.body);
+      }
+      requestOptions.method = "GET";
+      delete requestOptions.body;
+    }
   }
   const res = await fetch(target, {
     ...requestOptions,

@@ -340,7 +340,6 @@ def response_error(message, status=400):
 @app.after_request
 def clear_cookie_session(response):
     response.delete_cookie(app.config["SESSION_COOKIE_NAME"], path="/")
-    response.delete_cookie("session", path="/")
     return response
 
 
@@ -389,6 +388,9 @@ def request_auth_token():
     auth_header = (request.headers.get("Authorization") or "").strip()
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
+    payload_token = (request_payload().get("auth_token") or "").strip()
+    if payload_token:
+        return payload_token
     return ""
 
 

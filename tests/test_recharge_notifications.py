@@ -1,3 +1,5 @@
+import base64
+import json
 import unittest
 import uuid
 from unittest.mock import Mock, patch
@@ -46,6 +48,8 @@ class RechargeAndNotificationTest(unittest.TestCase):
             self.assertEqual(client.get("/api/channels").status_code, 401)
             self.assertEqual(client.get("/api/channels", headers={"Cookie": "session=invalid"}).status_code, 401)
             self.assertEqual(client.get("/api/channels", headers={"X-UB-Auth": token}).status_code, 200)
+            payload_token = base64.urlsafe_b64encode(json.dumps({"auth_token": token}).encode()).decode()
+            self.assertEqual(client.get("/api/channels", headers={"X-UB-Payload": payload_token}).status_code, 200)
 
     def test_alert_threshold_uses_channel_value_then_default(self):
         self.assertEqual(str(app.alert_threshold_from("15")), "15")
