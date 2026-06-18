@@ -108,7 +108,7 @@
               <input name="base_url" required placeholder="https://example.com/" />
             </label>
             <label>
-              <span>充值比例 CNY / USD</span>
+              <span>余额比例 USD / CNY</span>
               <input name="cny_rate" type="number" min="0.0001" step="0.0001" value="7.3" />
             </label>
             <div class="two-col">
@@ -133,6 +133,10 @@
           <div>
             <h2>渠道列表</h2>
             <p id="summaryText">等待数据</p>
+          </div>
+          <div class="table-actions">
+            <button id="showAllBtn" class="btn ghost" type="button">全部</button>
+            <button id="showLowBtn" class="btn ghost" type="button">低于阈值</button>
           </div>
         </div>
         <div id="channelList" class="channel-list"></div>

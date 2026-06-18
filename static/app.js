@@ -3,7 +3,9 @@ const state = {
   recharges: [],
   settings: null,
   auth: null,
+  authToken: window.localStorage.getItem("upstreamBalanceAuth") || "",
   busy: false,
+  channelFilter: "all",
 };
 
 const apiBase = new URL(".", window.location.href).pathname.replace(/\/$/, "");
@@ -33,6 +35,17 @@ function shortTime(value) {
 
 function platformText(platform) {
   return platform === "sub2api" ? "Sub2API" : "New API";
+}
+
+function thresholdCny(item) {
+  return Number(item.alert_cny || state.settings?.low_balance_alert_cny || 100);
+}
+
+function isLowChannel(item) {
+  if (item.status !== "ok") return false;
+  const balance = Number(item.cny_balance);
+  const threshold = thresholdCny(item);
+  return Number.isFinite(balance) && Number.isFinite(threshold) && balance <= threshold;
 }
 
 function toast(message) {
@@ -91,6 +104,9 @@ async function api(path, options = {}) {
   const publicPath = path.startsWith("/api/") ? `/_ub_api/${path.slice(5)}` : path;
   const target = `${apiBase}${publicPath}`;
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (state.authToken) {
+    headers["X-UB-Auth"] = state.authToken;
+  }
   const requestOptions = { ...options };
   if (publicPath.startsWith("/_ub_api/") && requestOptions.method && requestOptions.method.toUpperCase() !== "GET") {
     headers["X-UB-Method"] = requestOptions.method.toUpperCase();
@@ -109,6 +125,8 @@ async function api(path, options = {}) {
   if (!res.ok || data.ok === false) {
     if (res.status === 401) {
       state.auth = { needs_setup: false, authenticated: false, username: "", totp_enabled: false };
+      state.authToken = "";
+      window.localStorage.removeItem("upstreamBalanceAuth");
       renderAuth();
     }
     throw new Error(data.message || `请求失败 ${res.status}`);
@@ -120,6 +138,17 @@ async function loadAuth() {
   state.auth = await api("/api/auth/bootstrap");
   renderAuth();
   return state.auth;
+}
+
+function storeAuth(data) {
+  state.auth = data;
+  state.authToken = data.auth_token || "";
+  if (state.authToken) {
+    window.localStorage.setItem("upstreamBalanceAuth", state.authToken);
+  } else {
+    window.localStorage.removeItem("upstreamBalanceAuth");
+  }
+  delete state.auth.auth_token;
 }
 
 function setBusy(value) {
@@ -194,19 +223,29 @@ function renderChannels() {
   const totalCny = channels
     .filter((item) => item.status === "ok")
     .reduce((sum, item) => sum + Number(item.cny_balance || 0), 0);
-  el("summaryText").textContent = `${ok}/${total} 正常，合计 ${money(totalBalance)} USD / ${money(totalCny, 2)} CNY`;
+  const lowCount = channels.filter(isLowChannel).length;
+  el("summaryText").textContent = `${ok}/${total} 正常，合计 ${money(totalCny, 2)} CNY / ${money(totalBalance)} USD，${lowCount} 个低于阈值`;
+  el("showAllBtn").classList.toggle("active", state.channelFilter === "all");
+  el("showLowBtn").classList.toggle("active", state.channelFilter === "low");
 
-  list.innerHTML = channels.map((item) => {
+  const visibleChannels = state.channelFilter === "low" ? channels.filter(isLowChannel) : channels;
+  if (!visibleChannels.length) {
+    list.innerHTML = '<div class="empty compact-empty">没有低于阈值的渠道。</div>';
+    return;
+  }
+
+  list.innerHTML = visibleChannels.map((item) => {
     const statusClass = item.status === "ok" ? "ok" : item.status === "error" ? "error" : "";
     const statusText = item.status === "ok" ? "正常" : item.status === "error" ? "异常" : "待刷新";
     const used = item.used_balance !== null && item.used_balance !== undefined
-      ? `<div class="used">已用 ${money(item.used_balance)} USD / ${money(item.cny_used_balance, 2)} CNY</div>`
+      ? `<div class="used">已用 ${money(item.cny_used_balance, 2)} CNY / ${money(item.used_balance)} USD</div>`
       : "";
     const message = item.status === "error" && item.message
       ? `<div class="used">${escapeHtml(item.message)}</div>`
       : used;
+    const low = isLowChannel(item);
     return `
-      <article class="channel-card">
+      <article class="channel-card ${low ? "low" : ""}">
         <div class="channel-title">
           <strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong>
           <a class="site-link" href="${escapeAttr(item.base_url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(item.base_url)}">
@@ -222,8 +261,9 @@ function renderChannels() {
           <div class="last-check">${timeText(item.last_checked_at)}</div>
         </div>
         <div>
-          <div class="balance">${money(item.balance)} USD</div>
-          <div class="cny">${money(item.cny_balance, 2)} CNY</div>
+          <div class="balance">${money(item.cny_balance, 2)} CNY</div>
+          <div class="cny">${money(item.balance)} USD</div>
+          <div class="used ${low ? "low-text" : ""}">阈值 ${money(thresholdCny(item), 2)} CNY</div>
           ${message}
         </div>
         <div class="trend-cell">
@@ -234,6 +274,10 @@ function renderChannels() {
           <label>
             <span>比例</span>
             <input name="cny_rate" type="number" min="0.0001" step="0.0001" value="${escapeAttr(item.cny_rate || 7.3)}" />
+          </label>
+          <label>
+            <span>阈值</span>
+            <input name="alert_cny" type="number" min="0.01" step="0.01" value="${escapeAttr(thresholdCny(item))}" />
           </label>
           <button class="btn ghost" type="submit">保存</button>
         </form>
@@ -263,7 +307,7 @@ function renderRecharges() {
       </div>
       <div>
         <span class="balance small">+${money(item.amount_usd)} USD</span>
-        <div class="used">${money(item.amount_cny, 2)} CNY，比例 ${money(item.cny_rate, 4)}</div>
+        <div class="used">${money(item.amount_cny, 2)} CNY，比例 ${money(item.cny_rate, 4)} USD/CNY</div>
       </div>
       <div class="used">${escapeHtml(item.source_status || "-")} ${escapeHtml(item.source_type || "")}</div>
       <div class="last-check">${shortTime(item.detected_at)}</div>
@@ -293,10 +337,11 @@ async function handleLogin(event) {
 
   setBusy(true);
   try {
-    state.auth = await api(registering ? "/api/auth/register" : "/api/auth/login", {
+    const data = await api(registering ? "/api/auth/register" : "/api/auth/login", {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    storeAuth(data);
     form.reset();
     renderAuth();
     await loadApp();
@@ -312,6 +357,8 @@ async function logout() {
   setBusy(true);
   try {
     await api("/api/auth/logout", { method: "POST", body: "{}" });
+    state.authToken = "";
+    window.localStorage.removeItem("upstreamBalanceAuth");
     await loadAuth();
     el("loginForm").reset();
     toast("已退出");
@@ -484,6 +531,7 @@ async function updateRate(form) {
     username: channel.username,
     enabled: channel.enabled,
     cny_rate: form.elements.cny_rate.value,
+    alert_cny: form.elements.alert_cny.value,
   };
   setBusy(true);
   try {
@@ -560,6 +608,14 @@ async function boot() {
   el("testFeishuBtn").addEventListener("click", testFeishu);
   el("clearWecomBtn").addEventListener("click", clearWecom);
   el("clearFeishuBtn").addEventListener("click", clearFeishu);
+  el("showAllBtn").addEventListener("click", () => {
+    state.channelFilter = "all";
+    renderChannels();
+  });
+  el("showLowBtn").addEventListener("click", () => {
+    state.channelFilter = "low";
+    renderChannels();
+  });
   el("channelList").addEventListener("click", handleListClick);
   el("channelList").addEventListener("submit", handleListSubmit);
 

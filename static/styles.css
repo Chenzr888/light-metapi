@@ -136,6 +136,12 @@ h2 {
   gap: 10px;
 }
 
+.table-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
@@ -277,7 +283,7 @@ select:focus {
 
 .channel-card {
   display: grid;
-  grid-template-columns: minmax(150px, 1.2fr) 0.72fr 0.78fr 1fr 138px 138px minmax(170px, auto);
+  grid-template-columns: minmax(150px, 1.1fr) 0.7fr 0.72fr 1.05fr 126px 172px minmax(180px, auto);
   align-items: center;
   gap: 12px;
   border: 1px solid var(--line);
@@ -331,7 +337,7 @@ select:focus {
 }
 
 .balance {
-  font-size: 22px;
+  font-size: 26px;
   font-weight: 850;
   line-height: 1.1;
 }
@@ -344,13 +350,32 @@ select:focus {
   margin-top: 4px;
   color: var(--ok);
   font-size: 13px;
-  font-weight: 800;
+  font-weight: 700;
+}
+
+.low-text {
+  color: var(--warn);
 }
 
 .used {
   margin-top: 5px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.channel-card.low {
+  border-color: rgba(161, 92, 7, 0.35);
+  box-shadow: 0 0 0 1px rgba(161, 92, 7, 0.08) inset;
+}
+
+.channel-card.low .balance {
+  color: var(--warn);
+}
+
+.btn.active {
+  border-color: var(--brand);
+  background: rgba(217, 119, 87, 0.12);
+  color: var(--brand-strong);
 }
 
 .card-actions {

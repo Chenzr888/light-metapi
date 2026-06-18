@@ -17,6 +17,7 @@ from urllib.parse import quote, urljoin
 import requests
 from cryptography.fernet import Fernet
 from flask import Flask, jsonify, request, send_from_directory, session
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -46,6 +47,7 @@ def read_or_create_secret(path, size=32):
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="")
 app.config.update(
     SECRET_KEY=read_or_create_secret(SESSION_KEY_PATH),
+    SESSION_COOKIE_NAME="upstream_balance_session",
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
@@ -118,6 +120,7 @@ def init_db():
         )
         ensure_column(conn, "channels", "credential_enc", "TEXT")
         ensure_column(conn, "channels", "cny_rate", "REAL")
+        ensure_column(conn, "channels", "alert_cny", "REAL")
         conn.execute(
             """
             UPDATE channels
@@ -125,6 +128,14 @@ def init_db():
             WHERE cny_rate IS NULL
             """,
             (as_float(DEFAULT_CNY_RATE),),
+        )
+        conn.execute(
+            """
+            UPDATE channels
+            SET alert_cny = ?
+            WHERE alert_cny IS NULL
+            """,
+            (as_float(LOW_BALANCE_ALERT_CNY),),
         )
         conn.execute(
             """
@@ -209,7 +220,11 @@ def ensure_column(conn, table, column, column_type):
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     if column in {row["name"] for row in rows}:
         return
-    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
 
 
 def setting_get(key, default=""):
@@ -286,7 +301,17 @@ def cny_value(usd_value, cny_rate):
     usd = decimal_from(usd_value)
     if usd is None:
         return None
-    return as_float(usd * rate_from(cny_rate))
+    return as_float(usd / rate_from(cny_rate))
+
+
+def alert_threshold_from(value, default=None):
+    threshold = decimal_from(value)
+    if threshold is not None and threshold > 0:
+        return threshold
+    fallback = decimal_from(default)
+    if fallback is not None and fallback > 0:
+        return fallback
+    return LOW_BALANCE_ALERT_CNY
 
 
 def join_url_path(base_url, path):
@@ -310,6 +335,13 @@ def history_cutoff_iso():
 
 def response_error(message, status=400):
     return jsonify({"ok": False, "message": message}), status
+
+
+@app.after_request
+def clear_cookie_session(response):
+    response.delete_cookie(app.config["SESSION_COOKIE_NAME"], path="/")
+    response.delete_cookie("session", path="/")
+    return response
 
 
 def request_payload(force=False):
@@ -338,19 +370,57 @@ def get_user(user_id):
         return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
+def auth_serializer():
+    return URLSafeTimedSerializer(app.config["SECRET_KEY"], salt="upstream-balance-auth")
+
+
+def auth_token_fingerprint(user):
+    return hashlib.sha256(user["password_hash"].encode("utf-8")).hexdigest()[:16]
+
+
+def issue_auth_token(user):
+    return auth_serializer().dumps({"uid": user["id"], "fp": auth_token_fingerprint(user)})
+
+
+def request_auth_token():
+    token = (request.headers.get("X-UB-Auth") or "").strip()
+    if token:
+        return token
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return ""
+
+
+def user_from_auth_token(token):
+    if not token:
+        return None
+    max_age = int(app.config["PERMANENT_SESSION_LIFETIME"].total_seconds())
+    try:
+        payload = auth_serializer().loads(token, max_age=max_age)
+    except (BadSignature, SignatureExpired, TypeError, ValueError):
+        return None
+    user = get_user(payload.get("uid"))
+    if not user or payload.get("fp") != auth_token_fingerprint(user):
+        return None
+    return user
+
+
 def current_user():
-    user_id = session.get("user_id")
-    return get_user(user_id) if user_id else None
+    return user_from_auth_token(request_auth_token())
 
 
-def auth_state():
-    user = current_user()
-    return {
+def auth_state(user=None, include_token=False):
+    active_user = user if user is not None else current_user()
+    state = {
         "needs_setup": user_count() == 0,
-        "authenticated": bool(user),
-        "username": user["username"] if user else "",
-        "totp_enabled": bool(user["totp_enabled"]) if user else False,
+        "authenticated": bool(active_user),
+        "username": active_user["username"] if active_user else "",
+        "totp_enabled": bool(active_user["totp_enabled"]) if active_user else False,
     }
+    if include_token and active_user:
+        state["auth_token"] = issue_auth_token(active_user)
+    return state
 
 
 def login_required(fn):
@@ -517,7 +587,7 @@ def record_recharge_log(conn, channel_id, log, cny_rate):
             channel_id,
             as_float(amount_usd),
             as_float(amount_usd),
-            as_float(amount_usd * rate),
+            as_float(amount_usd / rate),
             as_float(rate),
             detected_at,
             source_ref,
@@ -549,6 +619,7 @@ def row_to_channel(row, include_secret=False):
     item.pop("credential_enc", None)
     item["enabled"] = bool(item["enabled"])
     item["cny_rate"] = as_float(rate_from(item.get("cny_rate")))
+    item["alert_cny"] = as_float(alert_threshold_from(item.get("alert_cny")))
     item["cny_balance"] = cny_value(item.get("balance"), item["cny_rate"])
     item["cny_used_balance"] = cny_value(item.get("used_balance"), item["cny_rate"])
     item["recharge_url"] = recharge_url_for(item["platform"], item["base_url"])
@@ -1350,8 +1421,9 @@ def should_send_low_balance_alert(channel):
     cny_balance = decimal_from(channel.get("cny_balance"))
     if cny_balance is None:
         return False
+    threshold = alert_threshold_from(channel.get("alert_cny"))
     key = low_balance_alert_key(channel["id"])
-    if cny_balance > LOW_BALANCE_ALERT_CNY:
+    if cny_balance > threshold:
         setting_delete(key)
         return False
     alerted_at = parse_iso_timestamp(setting_get(key))
@@ -1373,7 +1445,7 @@ def send_low_balance_alerts(channels):
             f"渠道: {channel.get('name') or channel.get('base_url')}",
             f"URL: {channel.get('base_url')}",
             f"余额: {format_money(channel.get('balance'))} USD / {format_money(channel.get('cny_balance'))} CNY",
-            f"阈值: {format_money(as_float(LOW_BALANCE_ALERT_CNY))} CNY",
+            f"阈值: {format_money(as_float(alert_threshold_from(channel.get('alert_cny'))))} CNY",
         ]
         if post_notification_text("\n".join(lines)):
             setting_set(low_balance_alert_key(channel["id"]), now_iso())
@@ -1413,10 +1485,7 @@ def auth_register():
             "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
             (username, generate_password_hash(password), ts, ts),
         )
-    session.clear()
-    session.permanent = True
-    session["user_id"] = cur.lastrowid
-    return jsonify({"ok": True, "data": auth_state()})
+    return jsonify({"ok": True, "data": auth_state(get_user(cur.lastrowid), include_token=True)})
 
 
 @app.post("/api/auth/login")
@@ -1429,10 +1498,7 @@ def auth_login():
         return response_error("账号或密码错误", 401)
     if row["totp_enabled"] and not verify_totp(row["totp_secret"], payload.get("totp")):
         return response_error("2FA 验证码错误", 401)
-    session.clear()
-    session.permanent = True
-    session["user_id"] = row["id"]
-    return jsonify({"ok": True, "data": auth_state()})
+    return jsonify({"ok": True, "data": auth_state(row, include_token=True)})
 
 
 @app.post("/api/auth/logout")
@@ -1563,6 +1629,7 @@ def api_create_channel():
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
     cny_rate = rate_from(payload.get("cny_rate"))
+    alert_cny = alert_threshold_from(payload.get("alert_cny"))
     if platform not in ("new_api", "sub2api"):
         return response_error("平台只支持 new_api 或 sub2api")
     if not name:
@@ -1578,11 +1645,11 @@ def api_create_channel():
         cur = conn.execute(
             """
             INSERT INTO channels(
-                name, platform, base_url, username, password_enc, credential_enc, cny_rate, enabled,
+                name, platform, base_url, username, password_enc, credential_enc, cny_rate, alert_cny, enabled,
                 balance, raw_balance, used_balance, raw_used_balance, request_count,
                 currency, status, message, raw_response, last_checked_at, created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
@@ -1591,6 +1658,7 @@ def api_create_channel():
                 username,
                 encrypt(json.dumps(credential, ensure_ascii=False)),
                 as_float(cny_rate),
+                as_float(alert_cny),
                 1,
                 as_float(result.get("balance")),
                 result.get("raw_balance"),
@@ -1627,6 +1695,7 @@ def api_update_channel(channel_id):
     username = (payload.get("username") or row["username"]).strip()
     enabled = 1 if payload.get("enabled", row["enabled"]) else 0
     cny_rate = rate_from(payload.get("cny_rate", row["cny_rate"]))
+    alert_cny = alert_threshold_from(payload.get("alert_cny"), channel_value(row, "alert_cny"))
     if platform not in ("new_api", "sub2api"):
         return response_error("平台只支持 new_api 或 sub2api")
     password = payload.get("password") or ""
@@ -1651,6 +1720,7 @@ def api_update_channel(channel_id):
                     password_enc = '',
                     credential_enc = ?,
                     cny_rate = ?,
+                    alert_cny = ?,
                     enabled = ?,
                     balance = ?,
                     raw_balance = ?,
@@ -1672,6 +1742,7 @@ def api_update_channel(channel_id):
                     username,
                     credential_enc,
                     as_float(cny_rate),
+                    as_float(alert_cny),
                     enabled,
                     as_float(result.get("balance")),
                     result.get("raw_balance"),
@@ -1703,11 +1774,12 @@ def api_update_channel(channel_id):
                     credential_enc = ?,
                     password_enc = '',
                     cny_rate = ?,
+                    alert_cny = ?,
                     enabled = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (name, platform, base_url, username, credential_enc, as_float(cny_rate), enabled, ts, channel_id),
+                (name, platform, base_url, username, credential_enc, as_float(cny_rate), as_float(alert_cny), enabled, ts, channel_id),
             )
     return jsonify({"ok": True, "data": row_to_channel(get_channel(channel_id))})
 

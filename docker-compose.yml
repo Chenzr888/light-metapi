@@ -1,7 +1,7 @@
 services:
-  light-metapi:
+  upstream-balance:
     build: .
-    container_name: light-metapi
+    container_name: upstream-balance
     restart: unless-stopped
     environment:
       HOST: 0.0.0.0

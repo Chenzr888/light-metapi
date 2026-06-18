@@ -1,7 +1,9 @@
 import unittest
+import uuid
 from unittest.mock import Mock, patch
 
 import requests
+from werkzeug.security import generate_password_hash
 
 import app
 
@@ -27,6 +29,51 @@ class FakeSession:
 
 
 class RechargeAndNotificationTest(unittest.TestCase):
+    def test_session_cookie_uses_app_specific_name(self):
+        self.assertEqual(app.app.config["SESSION_COOKIE_NAME"], "upstream_balance_session")
+
+    def test_auth_token_required_for_protected_routes(self):
+        ts = app.now_iso()
+        username = f"token-user-{uuid.uuid4().hex}"
+        with app.db() as conn:
+            cur = conn.execute(
+                "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
+                (username, generate_password_hash("secret123"), ts, ts),
+            )
+            user = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+        token = app.issue_auth_token(user)
+        with app.app.test_client() as client:
+            self.assertEqual(client.get("/api/channels").status_code, 401)
+            self.assertEqual(client.get("/api/channels", headers={"Cookie": "session=invalid"}).status_code, 401)
+            self.assertEqual(client.get("/api/channels", headers={"X-UB-Auth": token}).status_code, 200)
+
+    def test_alert_threshold_uses_channel_value_then_default(self):
+        self.assertEqual(str(app.alert_threshold_from("15")), "15")
+        self.assertEqual(str(app.alert_threshold_from(None, "25")), "25")
+        self.assertEqual(str(app.alert_threshold_from(None, None)), str(app.LOW_BALANCE_ALERT_CNY))
+
+    def test_channel_rows_expose_alert_threshold(self):
+        with app.db() as conn:
+            ts = app.now_iso()
+            cur = conn.execute(
+                """
+                INSERT INTO channels(
+                    name, platform, base_url, username, password_enc, credential_enc, cny_rate, alert_cny, enabled,
+                    balance, raw_balance, used_balance, raw_used_balance, request_count, currency, status, message,
+                    raw_response, last_checked_at, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, '', '', ?, ?, 1, ?, ?, NULL, NULL, NULL, 'USD', 'ok', '', '{}', ?, ?, ?)
+                """,
+                ("demo", "new_api", "https://example.com/", "u", 7.3, 88, 100, "100", None, ts, ts),
+            )
+            row = conn.execute("SELECT * FROM channels WHERE id = ?", (cur.lastrowid,)).fetchone()
+        item = app.row_to_channel(row)
+        self.assertEqual(str(item["alert_cny"]), "88.0")
+        self.assertAlmostEqual(item["cny_balance"], 100 / 7.3)
+
+    def test_cny_value_uses_usd_per_cny_ratio(self):
+        self.assertEqual(app.cny_value(3000, 10), 300.0)
+
     def test_recharge_urls_match_upstream_pages(self):
         self.assertEqual(app.recharge_url_for("new_api", "https://example.com/"), "https://example.com/console/topup")
         self.assertEqual(app.recharge_url_for("sub2api", "https://example.com/"), "https://example.com/purchase")
@@ -124,6 +171,11 @@ class RechargeAndNotificationTest(unittest.TestCase):
         with patch("app.post_wecom_text", side_effect=requests.RequestException("timeout")), \
                 patch("app.post_feishu_text", return_value=True):
             self.assertEqual(app.post_notification_text("hello"), ["feishu"])
+
+    def test_register_api_aliases_exposes_ub_prefix(self):
+        rules = [str(rule) for rule in app.app.url_map.iter_rules() if str(rule).startswith("/_ub_api/")]
+        self.assertIn("/_ub_api/auth/bootstrap", rules)
+        self.assertIn("/_ub_api/settings", rules)
 
 
 if __name__ == "__main__":
