@@ -1806,7 +1806,7 @@ def api_create_channel():
                 boss_recharge_required, balance, raw_balance, used_balance, raw_used_balance, request_count,
                 currency, status, message, raw_response, last_checked_at, created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,

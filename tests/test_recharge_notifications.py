@@ -266,6 +266,54 @@ class RechargeAndNotificationTest(unittest.TestCase):
 
         self.assertIsNone(app.balance_delta_recharge_log(8, previous, result, "2026-06-19T00:00:00+00:00"))
 
+    def test_create_channel_persists_after_successful_probe(self):
+        ts = app.now_iso()
+        username = f"create-channel-{uuid.uuid4().hex}"
+        with app.db() as conn:
+            cur = conn.execute(
+                "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
+                (username, generate_password_hash("secret123"), ts, ts),
+            )
+            user = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+
+        result = {
+            "balance": app.Decimal("12"),
+            "raw_balance": "6000000",
+            "used_balance": None,
+            "raw_used_balance": None,
+            "request_count": None,
+            "currency": "USD",
+            "status": "ok",
+            "message": "",
+            "raw_response": {},
+            "recharge_logs": [],
+        }
+        with app.app.test_client() as client:
+            with client.session_transaction() as sess:
+                sess["id"] = user["id"]
+                sess["username"] = user["username"]
+                sess["totp_enabled"] = False
+            with patch("app.provision_channel", return_value=({"access_token": "token", "user_id": 7}, result)):
+                response = client.post("/api/channels", json={
+                    "name": "created-demo",
+                    "platform": "new_api",
+                    "base_url": "https://created.example/",
+                    "username": "upstream-user",
+                    "password": "upstream-pass",
+                    "cny_rate": 7.3,
+                    "alert_cny": 100,
+                    "boss_recharge_required": True,
+                })
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        data = response.get_json()["data"]
+        self.assertEqual(data["name"], "created-demo")
+        self.assertTrue(data["boss_recharge_required"])
+        with app.db() as conn:
+            row = conn.execute("SELECT * FROM channels WHERE id = ?", (data["id"],)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["base_url"], "https://created.example/")
+
     def test_safe_new_api_recharge_logs_returns_empty_on_failure(self):
         with patch("app.new_api_recharge_logs", side_effect=RuntimeError("topup failed")):
             self.assertEqual(app.safe_new_api_recharge_logs("https://example.com/", {}), [])
