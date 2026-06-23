@@ -341,6 +341,17 @@ def response_error(message, status=400):
     return jsonify({"ok": False, "message": message}), status
 
 
+def log_channel_create(platform, base_url, username, message):
+    safe_platform = str(platform or "-")
+    safe_base_url = str(base_url or "-")
+    safe_username = str(username or "-")
+    print(
+        f"[channel-create] platform={safe_platform} base_url={safe_base_url} "
+        f"username={safe_username} result={message}",
+        flush=True,
+    )
+
+
 def request_payload(force=False):
     encoded = request.headers.get("X-UB-Payload")
     if encoded:
@@ -1794,7 +1805,11 @@ def api_create_channel():
     payload = request_payload(force=True)
     name = (payload.get("name") or "").strip()
     platform = (payload.get("platform") or "").strip()
-    base_url = normalize_url(payload.get("base_url"))
+    try:
+        base_url = normalize_url(payload.get("base_url"))
+    except ValueError as exc:
+        log_channel_create(platform, payload.get("base_url"), payload.get("username"), f"failed: {exc}")
+        return response_error(str(exc))
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
     totp_code = payload.get("totp") or payload.get("totp_code") or ""
@@ -1810,6 +1825,7 @@ def api_create_channel():
     try:
         credential, result = provision_channel(platform, base_url, username, password, totp_code)
     except Exception as exc:
+        log_channel_create(platform, base_url, username, f"failed: {exc}")
         return response_error(f"测试失败: {exc}", 502)
     ts = now_iso()
     with db() as conn:
@@ -1851,6 +1867,7 @@ def api_create_channel():
             sync_recharge_logs(conn, row, result.get("recharge_logs") or [])
         record_balance_history(conn, cur.lastrowid, result, ts)
         prune_history(conn)
+    log_channel_create(platform, base_url, username, f"saved id={cur.lastrowid}")
     return jsonify({"ok": True, "data": row_to_channel(get_channel(cur.lastrowid))})
 
 

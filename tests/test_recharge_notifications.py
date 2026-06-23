@@ -346,6 +346,31 @@ class RechargeAndNotificationTest(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["base_url"], "https://created.example/")
 
+    def test_create_channel_empty_url_returns_json_error(self):
+        ts = app.now_iso()
+        username = f"create-empty-url-{uuid.uuid4().hex}"
+        with app.db() as conn:
+            cur = conn.execute(
+                "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
+                (username, generate_password_hash("secret123"), ts, ts),
+            )
+            user = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+
+        with app.app.test_client() as client:
+            with client.session_transaction() as sess:
+                sess["id"] = user["id"]
+                sess["username"] = user["username"]
+                sess["totp_enabled"] = False
+            response = client.post("/api/channels", json={
+                "platform": "new_api",
+                "base_url": "",
+                "username": "upstream-user",
+                "password": "upstream-pass",
+            })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["message"], "URL 不能为空")
+
     def test_safe_new_api_recharge_logs_returns_empty_on_failure(self):
         with patch("app.new_api_recharge_logs", side_effect=RuntimeError("topup failed")):
             self.assertEqual(app.safe_new_api_recharge_logs("https://example.com/", {}), [])

@@ -436,6 +436,7 @@ async function createChannel(event) {
     form.reset();
     const rateInput = form.querySelector('[name="cny_rate"]');
     if (rateInput) rateInput.value = String(state.settings?.default_cny_rate || 7.3);
+    state.channelFilter = "all";
     await Promise.all([loadChannels(), loadRecharges()]);
     if (status) {
       status.textContent = "渠道已添加到列表。";
