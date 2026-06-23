@@ -476,6 +476,9 @@ class RechargeAndNotificationTest(unittest.TestCase):
         self.assertEqual(sent, [channel])
         notify.assert_called_once()
         email.assert_called_once()
+        content = notify.call_args.args[0]
+        self.assertEqual(content, "渠道名: low-demo\n余额: 1 CNY\n阈值: 100 CNY")
+        self.assertEqual(email.call_args.args[1], content)
         setting_set.assert_called_once()
 
     def test_register_api_aliases_exposes_ub_prefix(self):

@@ -1684,11 +1684,8 @@ def send_low_balance_alerts(channels):
         if not should_send_low_balance_alert(channel):
             continue
         lines = [
-            "上游余额告警",
-            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"渠道: {channel.get('name') or channel.get('base_url')}",
-            f"URL: {channel.get('base_url')}",
-            f"余额: {format_money(channel.get('balance'))} USD / {format_money(channel.get('cny_balance'))} CNY",
+            f"渠道名: {channel.get('name') or channel.get('base_url')}",
+            f"余额: {format_money(channel.get('cny_balance'))} CNY",
             f"阈值: {format_money(as_float(alert_threshold_from(channel.get('alert_cny'))))} CNY",
         ]
         content = "\n".join(lines)
