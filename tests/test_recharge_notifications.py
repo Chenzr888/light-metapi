@@ -1,3 +1,4 @@
+import sqlite3
 import unittest
 import uuid
 from unittest.mock import Mock, patch
@@ -346,6 +347,52 @@ class RechargeAndNotificationTest(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["base_url"], "https://created.example/")
 
+    def test_create_channel_persists_when_recharge_sync_fails(self):
+        ts = app.now_iso()
+        username = f"create-sync-fail-{uuid.uuid4().hex}"
+        with app.db() as conn:
+            cur = conn.execute(
+                "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
+                (username, generate_password_hash("secret123"), ts, ts),
+            )
+            user = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+
+        result = {
+            "balance": app.Decimal("12"),
+            "raw_balance": "6000000",
+            "used_balance": None,
+            "raw_used_balance": None,
+            "request_count": None,
+            "currency": "USD",
+            "status": "ok",
+            "message": "",
+            "raw_response": {},
+            "recharge_logs": [{"amount_usd": app.Decimal("1")}],
+        }
+        with app.app.test_client() as client:
+            with client.session_transaction() as sess:
+                sess["id"] = user["id"]
+                sess["username"] = user["username"]
+                sess["totp_enabled"] = False
+            with patch("app.provision_channel", return_value=({"access_token": "token", "user_id": 7}, result)), \
+                    patch("app.sync_recharge_logs", side_effect=sqlite3.OperationalError("bad recharge log")):
+                response = client.post("/api/channels", json={
+                    "name": "created-sync-fail",
+                    "platform": "new_api",
+                    "base_url": "https://created-sync-fail.example/",
+                    "username": "upstream-user",
+                    "password": "upstream-pass",
+                    "cny_rate": 7.3,
+                    "alert_cny": 100,
+                })
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        data = response.get_json()["data"]
+        with app.db() as conn:
+            row = conn.execute("SELECT * FROM channels WHERE id = ?", (data["id"],)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["name"], "created-sync-fail")
+
     def test_create_channel_empty_url_returns_json_error(self):
         ts = app.now_iso()
         username = f"create-empty-url-{uuid.uuid4().hex}"
@@ -408,6 +455,28 @@ class RechargeAndNotificationTest(unittest.TestCase):
         with patch("app.post_wecom_text", side_effect=requests.RequestException("timeout")), \
                 patch("app.post_feishu_text", return_value=True):
             self.assertEqual(app.post_notification_text("hello"), ["feishu"])
+
+    def test_low_balance_alert_sends_email_alongside_webhook(self):
+        channel = {
+            "id": 9001,
+            "status": "ok",
+            "name": "low-demo",
+            "base_url": "https://low.example/",
+            "balance": 1,
+            "cny_balance": 1,
+            "alert_cny": 100,
+        }
+        with patch("app.setting_get", side_effect=lambda key, default="": "1" if key == "notify_enabled" else default), \
+                patch("app.setting_set") as setting_set, \
+                patch("app.notification_webhooks_configured", return_value=True), \
+                patch("app.post_notification_text", return_value=["wecom"]) as notify, \
+                patch("app.post_low_balance_email", return_value=True) as email:
+            sent = app.send_low_balance_alerts([channel])
+
+        self.assertEqual(sent, [channel])
+        notify.assert_called_once()
+        email.assert_called_once()
+        setting_set.assert_called_once()
 
     def test_register_api_aliases_exposes_ub_prefix(self):
         rules = [str(rule) for rule in app.app.url_map.iter_rules() if str(rule).startswith("/_ub_api/")]

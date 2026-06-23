@@ -5,12 +5,14 @@ import json
 import os
 import re
 import secrets
+import smtplib
 import sqlite3
 import struct
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from email.message import EmailMessage
 from functools import wraps
 from pathlib import Path
 from urllib.parse import quote, urljoin
@@ -35,6 +37,12 @@ DEFAULT_CNY_RATE = Decimal(os.getenv("DEFAULT_CNY_RATE", "7.3"))
 RECHARGE_ROUNDING_UNIT = Decimal(os.getenv("RECHARGE_ROUNDING_UNIT", "100"))
 LOW_BALANCE_ALERT_CNY = Decimal(os.getenv("LOW_BALANCE_ALERT_CNY", "100"))
 LOW_BALANCE_ALERT_COOLDOWN_SECONDS = int(os.getenv("LOW_BALANCE_ALERT_COOLDOWN_SECONDS", "21600"))
+LOW_BALANCE_EMAIL_ENABLED = os.getenv("LOW_BALANCE_EMAIL_ENABLED", "0") == "1"
+LOW_BALANCE_EMAIL_FROM = os.getenv("LOW_BALANCE_EMAIL_FROM", "noreply@mail.sandboxai.top")
+LOW_BALANCE_EMAIL_SMTP_SERVER = os.getenv("LOW_BALANCE_EMAIL_SMTP_SERVER", "smtp.resend.com")
+LOW_BALANCE_EMAIL_SMTP_PORT = int(os.getenv("LOW_BALANCE_EMAIL_SMTP_PORT", "2587"))
+LOW_BALANCE_EMAIL_SMTP_USER = os.getenv("LOW_BALANCE_EMAIL_SMTP_USER", "resend")
+LOW_BALANCE_EMAIL_SMTP_TOKEN = os.getenv("LOW_BALANCE_EMAIL_SMTP_TOKEN", "")
 
 
 def read_or_create_secret(path, size=32):
@@ -256,9 +264,12 @@ def setting_delete(key):
 def public_settings():
     webhook_enc = setting_get("wecom_webhook_enc")
     feishu_webhook_enc = setting_get("feishu_webhook_enc")
+    email_recipients = setting_get("low_balance_email_recipients", os.getenv("LOW_BALANCE_EMAIL_RECIPIENTS", ""))
     return {
         "wecom_configured": bool(webhook_enc),
         "feishu_configured": bool(feishu_webhook_enc),
+        "email_configured": low_balance_email_configured(email_recipients),
+        "low_balance_email_recipients": email_recipients,
         "notify_enabled": setting_get("notify_enabled", "1") == "1",
         "refresh_interval_seconds": REFRESH_INTERVAL_SECONDS,
         "notify_interval_seconds": NOTIFY_INTERVAL_SECONDS,
@@ -649,6 +660,17 @@ def sync_recharge_logs(conn, channel, logs):
         if record_recharge_log(conn, channel["id"], log, channel["cny_rate"]):
             count += 1
     return count
+
+
+def safe_sync_recharge_logs(conn, channel, logs):
+    try:
+        return sync_recharge_logs(conn, channel, logs)
+    except Exception as exc:
+        print(
+            f"[recharge-sync] channel_id={channel['id']} failed: {exc}",
+            flush=True,
+        )
+        return 0
 
 
 def prune_history(conn):
@@ -1510,6 +1532,21 @@ def notification_webhooks_configured():
     return bool(wecom_webhook() or feishu_webhook())
 
 
+def low_balance_email_recipients(value=None):
+    raw = setting_get("low_balance_email_recipients", os.getenv("LOW_BALANCE_EMAIL_RECIPIENTS", "")) if value is None else value
+    return [item.strip() for item in re.split(r"[;,]", raw or "") if item.strip()]
+
+
+def low_balance_email_configured(recipients=None):
+    return bool(
+        LOW_BALANCE_EMAIL_ENABLED
+        and LOW_BALANCE_EMAIL_SMTP_SERVER
+        and LOW_BALANCE_EMAIL_SMTP_USER
+        and LOW_BALANCE_EMAIL_SMTP_TOKEN
+        and low_balance_email_recipients(recipients)
+    )
+
+
 def post_wecom_text(content):
     webhook = wecom_webhook()
     if not webhook:
@@ -1561,6 +1598,38 @@ def post_notification_text(content):
     return sent
 
 
+def html_body_from_text(content):
+    escaped = (
+        str(content)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\n", "<br>")
+    )
+    return f"<div style=\"font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;line-height:1.6\">{escaped}</div>"
+
+
+def post_low_balance_email(subject, content):
+    recipients = low_balance_email_recipients()
+    if not low_balance_email_configured():
+        return False
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = LOW_BALANCE_EMAIL_FROM
+    message["To"] = ", ".join(recipients)
+    message.set_content(content)
+    message.add_alternative(html_body_from_text(content), subtype="html")
+    try:
+        with smtplib.SMTP(LOW_BALANCE_EMAIL_SMTP_SERVER, LOW_BALANCE_EMAIL_SMTP_PORT, timeout=REQUEST_TIMEOUT) as smtp:
+            smtp.starttls()
+            smtp.login(LOW_BALANCE_EMAIL_SMTP_USER, LOW_BALANCE_EMAIL_SMTP_TOKEN)
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException) as exc:
+        print(f"[low-balance-email] failed: {exc}", flush=True)
+        return False
+    return True
+
+
 def send_notification_summary(channels):
     if not notification_webhooks_configured():
         return False
@@ -1608,7 +1677,7 @@ def should_send_low_balance_alert(channel):
 
 
 def send_low_balance_alerts(channels):
-    if setting_get("notify_enabled", "1") != "1" or not notification_webhooks_configured():
+    if setting_get("notify_enabled", "1") != "1":
         return []
     sent = []
     for channel in channels:
@@ -1622,7 +1691,10 @@ def send_low_balance_alerts(channels):
             f"余额: {format_money(channel.get('balance'))} USD / {format_money(channel.get('cny_balance'))} CNY",
             f"阈值: {format_money(as_float(alert_threshold_from(channel.get('alert_cny'))))} CNY",
         ]
-        if post_notification_text("\n".join(lines)):
+        content = "\n".join(lines)
+        notify_sent = post_notification_text(content) if notification_webhooks_configured() else []
+        email_sent = post_low_balance_email("上游余额告警", content)
+        if notify_sent or email_sent:
             setting_set(low_balance_alert_key(channel["id"]), now_iso())
             sent.append(channel)
     return sent
@@ -1745,6 +1817,8 @@ def update_settings():
             setting_set("feishu_webhook_enc", encrypt(webhook))
         elif payload.get("clear_feishu"):
             setting_set("feishu_webhook_enc", "")
+    if "low_balance_email_recipients" in payload:
+        setting_set("low_balance_email_recipients", (payload.get("low_balance_email_recipients") or "").strip())
     if "notify_enabled" in payload:
         setting_set("notify_enabled", "1" if payload.get("notify_enabled") else "0")
     return jsonify({"ok": True, "data": public_settings()})
@@ -1864,7 +1938,7 @@ def api_create_channel():
         )
         row = conn.execute("SELECT * FROM channels WHERE id = ?", (cur.lastrowid,)).fetchone()
         if row:
-            sync_recharge_logs(conn, row, result.get("recharge_logs") or [])
+            safe_sync_recharge_logs(conn, row, result.get("recharge_logs") or [])
         record_balance_history(conn, cur.lastrowid, result, ts)
         prune_history(conn)
     log_channel_create(platform, base_url, username, f"saved id={cur.lastrowid}")

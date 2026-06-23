@@ -172,6 +172,10 @@ async function loadSettings() {
   const feishuStatus = el("feishuStatus");
   feishuStatus.textContent = state.settings.feishu_configured ? "已配置" : "未配置";
   feishuStatus.className = `pill ${state.settings.feishu_configured ? "ok" : ""}`;
+  const emailRecipients = el("lowBalanceEmailRecipients");
+  if (emailRecipients) {
+    emailRecipients.value = state.settings.low_balance_email_recipients || "";
+  }
 }
 
 async function loadChannels() {
@@ -463,6 +467,7 @@ async function saveSettings(event) {
       body: JSON.stringify({
         wecom_webhook: el("wecomWebhook").value.trim(),
         feishu_webhook: el("feishuWebhook").value.trim(),
+        low_balance_email_recipients: el("lowBalanceEmailRecipients").value.trim(),
         notify_enabled: el("notifyEnabled").checked,
       }),
     });

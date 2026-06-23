@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>light-metapi</title>
-    <link rel="stylesheet" href="styles.css?v=20260623-channel-save2" />
+    <link rel="stylesheet" href="styles.css?v=20260623-email-alert" />
   </head>
   <body>
     <section id="loginView" class="login-view">
@@ -66,6 +66,10 @@
             <label>
               <span>飞书 Webhook</span>
               <input id="feishuWebhook" type="password" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+            </label>
+            <label>
+              <span>低余额邮箱</span>
+              <input id="lowBalanceEmailRecipients" placeholder="ops@example.com; boss@example.com" />
             </label>
             <label class="switch-line">
               <input id="notifyEnabled" type="checkbox" checked />
