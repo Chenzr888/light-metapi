@@ -42,6 +42,20 @@ class RouteSession:
         return self.routes[url]
 
 
+class NewApiTwoFASession:
+    def __init__(self):
+        self.headers = {}
+        self.posts = []
+
+    def post(self, url, **kwargs):
+        self.posts.append((url, kwargs))
+        if url.endswith("/api/user/login"):
+            return FakeResponse({"success": True, "data": {"require_2fa": True}})
+        if url.endswith("/api/user/login/2fa"):
+            return FakeResponse({"success": True, "data": {"id": 42, "username": "demo"}})
+        return FakeResponse({"success": False, "message": "unexpected post"})
+
+
 class RechargeAndNotificationTest(unittest.TestCase):
     def test_session_cookie_uses_app_specific_name(self):
         self.assertEqual(app.app.config["SESSION_COOKIE_NAME"], "ub_admin_session")
@@ -172,6 +186,24 @@ class RechargeAndNotificationTest(unittest.TestCase):
         self.assertEqual(url, "https://example.com/api/user/topup/self")
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer token")
         self.assertEqual(kwargs["headers"]["New-Api-User"], "7")
+
+    def test_new_api_login_supports_2fa_flow(self):
+        session = NewApiTwoFASession()
+
+        with patch("app.requests.Session", return_value=session):
+            _, user = app.new_api_login("https://example.com/", "demo", "secret123", "123456")
+
+        self.assertEqual(user["id"], 42)
+        self.assertEqual(session.posts[0][0], "https://example.com/api/user/login")
+        self.assertEqual(session.posts[1][0], "https://example.com/api/user/login/2fa")
+        self.assertEqual(session.posts[1][1]["json"], {"code": "123456"})
+
+    def test_new_api_login_requires_2fa_code_when_upstream_requests_it(self):
+        session = NewApiTwoFASession()
+
+        with patch("app.requests.Session", return_value=session):
+            with self.assertRaisesRegex(RuntimeError, "2FA"):
+                app.new_api_login("https://example.com/", "demo", "secret123")
 
     def test_new_api_recharge_logs_convert_quota_when_needed(self):
         session = FakeSession(FakeResponse({

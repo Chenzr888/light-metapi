@@ -1115,7 +1115,7 @@ def fetch_sub2api(channel):
     return result
 
 
-def new_api_login(base_url, username, password):
+def new_api_login(base_url, username, password, totp_code=""):
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
     login = session.post(
@@ -1128,6 +1128,19 @@ def new_api_login(base_url, username, password):
         raise RuntimeError(read_message(login_data) or f"登录失败 HTTP {login.status_code}")
 
     user = login_data.get("data") if isinstance(login_data.get("data"), dict) else {}
+    if user.get("require_2fa"):
+        code = "".join(ch for ch in str(totp_code or "") if ch.isdigit())
+        if not code:
+            raise RuntimeError("上游 New API 已开启 2FA，请填写验证码")
+        twofa = session.post(
+            urljoin(base_url, "/api/user/login/2fa"),
+            json={"code": code},
+            timeout=REQUEST_TIMEOUT,
+        )
+        twofa_data = safe_json(twofa)
+        if twofa.status_code >= 400 or not truthy_success(twofa_data):
+            raise RuntimeError(read_message(twofa_data) or f"2FA 登录失败 HTTP {twofa.status_code}")
+        user = twofa_data.get("data") if isinstance(twofa_data.get("data"), dict) else {}
     return session, user
 
 
@@ -1305,9 +1318,9 @@ def fetch_new_api(channel):
     return result
 
 
-def provision_channel(platform, base_url, username, password):
+def provision_channel(platform, base_url, username, password, totp_code=""):
     if platform == "new_api":
-        session, user = new_api_login(base_url, username, password)
+        session, user = new_api_login(base_url, username, password, totp_code)
         credential = new_api_generate_token(base_url, session, user.get("id"))
         result = build_new_api_result(base_url, new_api_self(base_url, credential, session=session))
         result["recharge_logs"] = safe_new_api_recharge_logs(base_url, credential, session=session)
@@ -1784,6 +1797,7 @@ def api_create_channel():
     base_url = normalize_url(payload.get("base_url"))
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
+    totp_code = payload.get("totp") or payload.get("totp_code") or ""
     cny_rate = rate_from(payload.get("cny_rate"))
     alert_cny = alert_threshold_from(payload.get("alert_cny"))
     boss_recharge_required = 1 if payload.get("boss_recharge_required") else 0
@@ -1794,7 +1808,7 @@ def api_create_channel():
     if not username or not password:
         return response_error("账号和密码必填")
     try:
-        credential, result = provision_channel(platform, base_url, username, password)
+        credential, result = provision_channel(platform, base_url, username, password, totp_code)
     except Exception as exc:
         return response_error(f"测试失败: {exc}", 502)
     ts = now_iso()
@@ -1858,11 +1872,12 @@ def api_update_channel(channel_id):
     if platform not in ("new_api", "sub2api"):
         return response_error("平台只支持 new_api 或 sub2api")
     password = payload.get("password") or ""
+    totp_code = payload.get("totp") or payload.get("totp_code") or ""
     credential_enc = channel_value(row, "credential_enc", "")
     result = None
     if password:
         try:
-            credential, result = provision_channel(platform, base_url, username, password)
+            credential, result = provision_channel(platform, base_url, username, password, totp_code)
             credential_enc = encrypt(json.dumps(credential, ensure_ascii=False))
         except Exception as exc:
             return response_error(f"测试失败: {exc}", 502)

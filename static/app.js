@@ -424,6 +424,12 @@ async function createChannel(event) {
   const form = event.currentTarget;
   const payload = Object.fromEntries(new FormData(form).entries());
   payload.boss_recharge_required = Boolean(form.elements.boss_recharge_required?.checked);
+  if (!payload.totp) delete payload.totp;
+  const status = el("channelFormStatus");
+  if (status) {
+    status.textContent = "正在测试上游登录并保存渠道...";
+    status.className = "form-status";
+  }
   setBusy(true);
   try {
     await api("/api/channels", { method: "POST", body: JSON.stringify(payload) });
@@ -431,8 +437,16 @@ async function createChannel(event) {
     const rateInput = form.querySelector('[name="cny_rate"]');
     if (rateInput) rateInput.value = String(state.settings?.default_cny_rate || 7.3);
     await Promise.all([loadChannels(), loadRecharges()]);
+    if (status) {
+      status.textContent = "渠道已添加到列表。";
+      status.className = "form-status ok";
+    }
     toast("渠道已添加");
   } catch (error) {
+    if (status) {
+      status.textContent = error.message;
+      status.className = "form-status error";
+    }
     toast(error.message);
   } finally {
     setBusy(false);
