@@ -3,6 +3,12 @@ __pycache__/
 *.pyc
 .venv/
 .env
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
 *.sqlite3
 *.db
 *.secret
