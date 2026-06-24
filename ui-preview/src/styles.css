@@ -47,6 +47,54 @@ a {
   min-height: 100vh;
 }
 
+.login-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: min(420px, calc(100vw - 32px));
+  display: grid;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 22px;
+}
+
+.login-card label,
+.alert-form label,
+.twofa-box label {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.login-card input,
+.alert-form input,
+.twofa-box input {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  outline: 0;
+  padding: 0 12px;
+}
+
+.login-card input:focus,
+.alert-form input:focus,
+.twofa-box input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(24, 116, 92, 0.14);
+}
+
 .sidebar {
   position: sticky;
   top: 0;
@@ -63,6 +111,10 @@ a {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+.compact-brand {
+  margin-bottom: 4px;
 }
 
 .brand-mark {
@@ -250,6 +302,15 @@ h2 {
   background: transparent;
   color: var(--accent-strong);
   font-weight: 800;
+}
+
+.text-button.left {
+  min-height: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  padding: 0;
 }
 
 .full {
@@ -460,6 +521,33 @@ h2 {
 .alert-stack {
   display: grid;
   gap: 10px;
+}
+
+.alert-form,
+.twofa-box {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.twofa-box code {
+  display: block;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfb;
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.twofa-box a {
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.security-panel {
+  margin-top: 14px;
 }
 
 .recharge-item,

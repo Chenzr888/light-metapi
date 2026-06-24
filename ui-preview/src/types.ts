@@ -15,6 +15,7 @@ export interface Channel {
   lastCheckedAt: string | null;
   rechargeUrl: string;
   bossRechargeRequired: boolean;
+  enabled: boolean;
   message?: string;
   history: number[];
 }
@@ -34,7 +35,26 @@ export interface DraftChannel {
   baseUrl: string;
   username: string;
   password: string;
+  totp: string;
   cnyRate: string;
   thresholdCny: string;
   bossRechargeRequired: boolean;
+}
+
+export interface AuthState {
+  needsSetup: boolean;
+  authenticated: boolean;
+  username: string;
+  totpEnabled: boolean;
+}
+
+export interface SettingsState {
+  wecomConfigured: boolean;
+  feishuConfigured: boolean;
+  emailConfigured: boolean;
+  emailRecipients: string;
+  notifyEnabled: boolean;
+  defaultCnyRate: number;
+  lowBalanceAlertCny: number;
+  refreshIntervalSeconds: number;
 }

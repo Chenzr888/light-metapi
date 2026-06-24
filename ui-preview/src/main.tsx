@@ -1,4 +1,4 @@
-import React, { FormEvent, useMemo, useState } from "react";
+import React, { FormEvent, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   AlertTriangle,
@@ -8,6 +8,8 @@ import {
   ExternalLink,
   Eye,
   Gauge,
+  KeyRound,
+  LogOut,
   Mail,
   Plus,
   RefreshCw,
@@ -18,8 +20,24 @@ import {
   WalletCards,
   X,
 } from "lucide-react";
-import { initialChannels, initialRecharges } from "./data";
-import type { Channel, DraftChannel, Platform } from "./types";
+import {
+  confirmTwofa,
+  createChannel as apiCreateChannel,
+  deleteChannel as apiDeleteChannel,
+  loadAuth,
+  loadChannels,
+  loadRecharges,
+  loadSettings,
+  login,
+  logout as apiLogout,
+  refreshAllChannels,
+  refreshChannel,
+  saveAlertSettings,
+  setupTwofa,
+  testWebhook,
+  updateChannel,
+} from "./api";
+import type { AuthState, Channel, DraftChannel, Platform, RechargeLog, SettingsState } from "./types";
 import "./styles.css";
 
 type DrawerMode = "add" | "settings" | null;
@@ -31,9 +49,17 @@ const emptyDraft: DraftChannel = {
   baseUrl: "",
   username: "",
   password: "",
+  totp: "",
   cnyRate: "1",
   thresholdCny: "100",
   bossRechargeRequired: false,
+};
+
+const emptyAuth: AuthState = {
+  needsSetup: false,
+  authenticated: false,
+  username: "",
+  totpEnabled: false,
 };
 
 function money(value: number | null | undefined, digits = 2) {
@@ -79,14 +105,21 @@ function Sparkline({ values }: { values: number[] }) {
 }
 
 function App() {
-  const [channels, setChannels] = useState(initialChannels);
+  const [auth, setAuth] = useState<AuthState>(emptyAuth);
+  const [authReady, setAuthReady] = useState(false);
+  const [loginTotp, setLoginTotp] = useState("");
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [recharges, setRecharges] = useState<RechargeLog[]>([]);
+  const [settings, setSettings] = useState<SettingsState | null>(null);
   const [drawerMode, setDrawerMode] = useState<DrawerMode>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [filter, setFilter] = useState<FilterMode>("all");
   const [query, setQuery] = useState("");
   const [draft, setDraft] = useState<DraftChannel>(emptyDraft);
   const [syncing, setSyncing] = useState(false);
-  const [toast, setToast] = useState("本地 TypeScript 预览");
+  const [toast, setToast] = useState("");
+  const [twofaSetup, setTwofaSetup] = useState<{ secret: string; otpauth_uri: string } | null>(null);
+  const [twofaCode, setTwofaCode] = useState("");
 
   const selected = selectedId ? channels.find((item) => item.id === selectedId) ?? null : null;
 
@@ -111,6 +144,21 @@ function App() {
     return matchQuery && matchFilter;
   });
 
+  useEffect(() => {
+    loadAuth()
+      .then((nextAuth) => {
+        setAuth(nextAuth);
+        setAuthReady(true);
+        if (nextAuth.authenticated) {
+          void loadDashboard();
+        }
+      })
+      .catch((error: Error) => {
+        setAuthReady(true);
+        showToast(error.message);
+      });
+  }, []);
+
   function showToast(message: string) {
     setToast(message);
     window.clearTimeout(window.__uiPreviewToast);
@@ -118,7 +166,11 @@ function App() {
   }
 
   function openAdd() {
-    setDraft(emptyDraft);
+    setDraft({
+      ...emptyDraft,
+      cnyRate: String(settings?.defaultCnyRate || 1),
+      thresholdCny: String(settings?.lowBalanceAlertCny || 100),
+    });
     setSelectedId(null);
     setDrawerMode("add");
   }
@@ -128,92 +180,243 @@ function App() {
     setDrawerMode("settings");
   }
 
-  function refreshOne(id: number) {
-    setChannels((items) =>
-      items.map((item) =>
-        item.id === id
-          ? {
-              ...item,
-              status: "ok",
-              balanceCny: item.balanceCny === null ? 0 : Number((item.balanceCny - Math.random() * 3).toFixed(2)),
-              balanceUsd: item.balanceUsd === null ? 0 : Number((item.balanceUsd - Math.random() * 3).toFixed(2)),
-              lastCheckedAt: new Date().toISOString(),
-              message: "",
-            }
-          : item,
-      ),
-    );
-    showToast("已刷新这条渠道");
+  async function loadDashboard() {
+    const [nextSettings, nextChannels, nextRecharges] = await Promise.all([
+      loadSettings(),
+      loadChannels(),
+      loadRecharges(),
+    ]);
+    setSettings(nextSettings);
+    setChannels(nextChannels);
+    setRecharges(nextRecharges);
   }
 
-  function refreshAll() {
+  async function refreshOne(id: number) {
     setSyncing(true);
-    window.setTimeout(() => {
-      setChannels((items) =>
-        items.map((item) => ({
-          ...item,
-          lastCheckedAt: new Date().toISOString(),
-          balanceCny: item.balanceCny === null ? null : Number((item.balanceCny - Math.random() * 2).toFixed(2)),
-          balanceUsd: item.balanceUsd === null ? null : Number((item.balanceUsd - Math.random() * 2).toFixed(2)),
-        })),
-      );
+    try {
+      const updated = await refreshChannel(id);
+      setChannels((items) => items.map((item) => (item.id === id ? updated : item)));
+      setRecharges(await loadRecharges());
+      showToast("已刷新这条渠道");
+    } catch (error) {
+      showToast((error as Error).message);
+      setChannels(await loadChannels());
+    } finally {
       setSyncing(false);
-      showToast("已手动刷新余额");
-    }, 550);
+    }
   }
 
-  function createChannel(event: FormEvent) {
+  async function refreshAll(notify = false) {
+    setSyncing(true);
+    try {
+      setChannels(await refreshAllChannels(notify));
+      setRecharges(await loadRecharges());
+      showToast(notify ? "刷新完成并已推送" : "已手动刷新余额");
+    } catch (error) {
+      showToast((error as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function createChannel(event: FormEvent) {
     event.preventDefault();
-    const next: Channel = {
-      id: Date.now(),
-      name: draft.name.trim() || draft.baseUrl.replace(/^https?:\/\//, "").replace(/\/$/, ""),
-      platform: draft.platform,
-      baseUrl: draft.baseUrl.trim(),
-      username: draft.username.trim(),
-      status: "ok",
-      balanceUsd: 100,
-      balanceCny: 100,
-      thresholdCny: Number(draft.thresholdCny || 100),
-      cnyRate: Number(draft.cnyRate || 1),
-      lastCheckedAt: new Date().toISOString(),
-      rechargeUrl: `${draft.baseUrl.replace(/\/$/, "")}/${draft.platform === "sub2api" ? "purchase" : "console/topup"}`,
-      bossRechargeRequired: draft.bossRechargeRequired,
-      history: [100, 100],
-    };
-    setChannels((items) => [next, ...items]);
-    setDrawerMode(null);
-    showToast("渠道已通过本地预览添加");
+    setSyncing(true);
+    try {
+      const next = await apiCreateChannel(draft);
+      setChannels((items) => [next, ...items]);
+      setRecharges(await loadRecharges());
+      setDrawerMode(null);
+      showToast("渠道已添加");
+    } catch (error) {
+      showToast((error as Error).message);
+    } finally {
+      setSyncing(false);
+    }
   }
 
-  function saveSettings(event: FormEvent) {
+  async function saveSettings(event: FormEvent) {
     event.preventDefault();
     if (!selected) return;
     const form = event.currentTarget as HTMLFormElement;
     const formData = new FormData(form);
-    setChannels((items) =>
-      items.map((item) =>
-        item.id === selected.id
-          ? {
-              ...item,
-              name: String(formData.get("name") || item.name),
-              thresholdCny: Number(formData.get("thresholdCny") || item.thresholdCny),
-              cnyRate: Number(formData.get("cnyRate") || item.cnyRate),
-              bossRechargeRequired: formData.get("bossRechargeRequired") === "on",
-            }
-          : item,
-      ),
-    );
-    setDrawerMode(null);
-    showToast("渠道设置已保存");
+    setSyncing(true);
+    try {
+      const updated = await updateChannel(selected, {
+        name: String(formData.get("name") || selected.name),
+        thresholdCny: Number(formData.get("thresholdCny") || selected.thresholdCny),
+        cnyRate: Number(formData.get("cnyRate") || selected.cnyRate),
+        bossRechargeRequired: formData.get("bossRechargeRequired") === "on",
+      });
+      setChannels((items) => items.map((item) => (item.id === selected.id ? updated : item)));
+      setDrawerMode(null);
+      showToast("渠道设置已保存");
+    } catch (error) {
+      showToast((error as Error).message);
+    } finally {
+      setSyncing(false);
+    }
   }
 
-  function deleteSelected() {
+  async function deleteSelected() {
     if (!selected) return;
     const ok = window.confirm(`删除 ${selected.name}？`);
     if (!ok) return;
-    setChannels((items) => items.filter((item) => item.id !== selected.id));
-    setDrawerMode(null);
-    showToast("渠道已删除");
+    setSyncing(true);
+    try {
+      await apiDeleteChannel(selected.id);
+      setChannels((items) => items.filter((item) => item.id !== selected.id));
+      setRecharges(await loadRecharges());
+      setDrawerMode(null);
+      showToast("渠道已删除");
+    } catch (error) {
+      showToast((error as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function handleLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formData = new FormData(event.currentTarget);
+    setSyncing(true);
+    try {
+      const nextAuth = await login({
+        username: String(formData.get("username") || "").trim(),
+        password: String(formData.get("password") || ""),
+        totp: loginTotp || undefined,
+      }, auth.needsSetup);
+      setAuth(nextAuth);
+      setLoginTotp("");
+      await loadDashboard();
+      showToast(auth.needsSetup ? "管理员账号已创建" : "登录成功");
+    } catch (error) {
+      showToast((error as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function handleLogout() {
+    setSyncing(true);
+    try {
+      await apiLogout();
+      setAuth({ ...emptyAuth, needsSetup: false });
+      setChannels([]);
+      setRecharges([]);
+      setSettings(null);
+      setTwofaSetup(null);
+      setDrawerMode(null);
+      showToast("已退出");
+    } catch (error) {
+      showToast((error as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function handleSetupTwofa() {
+    setSyncing(true);
+    try {
+      setTwofaSetup(await setupTwofa());
+      showToast("请用验证器添加密钥");
+    } catch (error) {
+      showToast((error as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function handleConfirmTwofa(event: FormEvent) {
+    event.preventDefault();
+    setSyncing(true);
+    try {
+      setAuth(await confirmTwofa(twofaCode));
+      setTwofaSetup(null);
+      setTwofaCode("");
+      showToast("2FA 已绑定");
+    } catch (error) {
+      showToast((error as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function saveNotificationSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const formData = new FormData(form);
+    setSyncing(true);
+    try {
+      setSettings(await saveAlertSettings({
+        wecomWebhook: String(formData.get("wecomWebhook") || ""),
+        feishuWebhook: String(formData.get("feishuWebhook") || ""),
+        emailRecipients: String(formData.get("emailRecipients") || ""),
+        notifyEnabled: formData.get("notifyEnabled") === "on",
+      }));
+      const wecomInput = form.elements.namedItem("wecomWebhook") as HTMLInputElement | null;
+      const feishuInput = form.elements.namedItem("feishuWebhook") as HTMLInputElement | null;
+      if (wecomInput) wecomInput.value = "";
+      if (feishuInput) feishuInput.value = "";
+      showToast("告警配置已保存");
+    } catch (error) {
+      showToast((error as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function handleTestWebhook(kind: "wecom" | "feishu") {
+    setSyncing(true);
+    try {
+      await testWebhook(kind);
+      showToast(kind === "wecom" ? "企业微信测试已发送" : "飞书测试已发送");
+    } catch (error) {
+      showToast((error as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  if (!authReady) {
+    return (
+      <div className="login-screen">
+        <div className="login-card">
+          <div className="brand compact-brand">
+            <div className="brand-mark">UB</div>
+            <div>
+              <strong>Upstream Balance</strong>
+              <span>正在检查登录状态</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!auth.authenticated) {
+    return (
+      <div className="login-screen">
+        <form className="login-card" onSubmit={handleLogin}>
+          <div className="brand compact-brand">
+            <div className="brand-mark">UB</div>
+            <div>
+              <strong>Upstream Balance</strong>
+              <span>{auth.needsSetup ? "创建管理员账号" : "管理员登录"}</span>
+            </div>
+          </div>
+          <label>账号<input name="username" autoComplete="username" required /></label>
+          <label>密码<input name="password" type="password" autoComplete={auth.needsSetup ? "new-password" : "current-password"} required /></label>
+          {!auth.needsSetup && (
+            <label>2FA 验证码<input value={loginTotp} onChange={(event) => setLoginTotp(event.target.value)} inputMode="numeric" autoComplete="one-time-code" /></label>
+          )}
+          <button className="primary-button full" type="submit" disabled={syncing}>
+            <KeyRound size={18} /> {auth.needsSetup ? "创建并进入" : "登录进入"}
+          </button>
+        </form>
+        <div className={`toast ${toast ? "show" : ""}`}>{toast}</div>
+      </div>
+    );
   }
 
   return (
@@ -223,7 +426,7 @@ function App() {
           <div className="brand-mark">UB</div>
           <div>
             <strong>Upstream Balance</strong>
-            <span>TypeScript Preview</span>
+            <span>Admin Console</span>
           </div>
         </div>
         <nav className="nav">
@@ -232,9 +435,10 @@ function App() {
           <button className="nav-item"><Bell size={18} /> 告警</button>
           <button className="nav-item"><ShieldCheck size={18} /> 安全</button>
         </nav>
-        <div className="sidebar-note">
-          <span>核心后端保持现状</span>
-          <strong>本地先看交互</strong>
+        <div className="sidebar-note user-note">
+          <span>{auth.username}</span>
+          <strong>{auth.totpEnabled ? "2FA 已绑定" : "建议绑定 2FA"}</strong>
+          <button className="text-button left" onClick={handleLogout}><LogOut size={16} /> 退出登录</button>
         </div>
       </aside>
 
@@ -249,8 +453,11 @@ function App() {
               <Search size={16} />
               <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索渠道、URL、账号" />
             </div>
-            <button className="icon-button" onClick={refreshAll} disabled={syncing} title="刷新余额">
+            <button className="icon-button" onClick={() => void refreshAll(false)} disabled={syncing} title="刷新余额">
               <RefreshCw size={18} className={syncing ? "spin" : ""} />
+            </button>
+            <button className="icon-button" onClick={() => void refreshAll(true)} disabled={syncing} title="刷新并推送">
+              <Bell size={18} />
             </button>
             <button className="primary-button" onClick={openAdd}>
               <Plus size={18} /> 添加渠道
@@ -272,7 +479,7 @@ function App() {
           <article className={stats.low ? "warn" : ""}>
             <span>低于阈值</span>
             <strong>{stats.low}</strong>
-            <em>触发邮件 + 企业微信</em>
+            <em>{settings?.emailConfigured ? "触发邮件 + 企业微信" : "按当前配置告警"}</em>
           </article>
           <article className={stats.error ? "danger" : ""}>
             <span>异常</span>
@@ -340,7 +547,7 @@ function App() {
               <button className="text-button">查看全部</button>
             </div>
             <div className="recharge-list">
-              {initialRecharges.map((item) => (
+              {recharges.map((item) => (
                 <div className="recharge-item" key={item.id}>
                   <CircleDollarSign size={18} />
                   <div>
@@ -356,16 +563,41 @@ function App() {
           <article className="panel">
             <div className="section-head compact">
               <h2>告警通道</h2>
-              <button className="text-button">编辑</button>
+              <button className="text-button" onClick={() => void handleTestWebhook("wecom")}>测试企业微信</button>
             </div>
             <div className="alert-stack">
-              <div><CheckCircle2 size={18} /> 企业微信已配置</div>
-              <div><CheckCircle2 size={18} /> 飞书已配置</div>
-              <div><Mail size={18} /> cheny2812@qq.com</div>
+              <div><CheckCircle2 size={18} /> 企业微信{settings?.wecomConfigured ? "已配置" : "待配置"}</div>
+              <div><CheckCircle2 size={18} /> 飞书{settings?.feishuConfigured ? "已配置" : "待配置"}</div>
+              <div><Mail size={18} /> {settings?.emailRecipients || "未设置低余额邮箱"}</div>
               <div><AlertTriangle size={18} /> 低余额正文：渠道名 + 余额 + 阈值</div>
             </div>
+            <form className="alert-form" onSubmit={saveNotificationSettings}>
+              <label>低余额邮箱<input name="emailRecipients" defaultValue={settings?.emailRecipients || ""} /></label>
+              <label>企业微信 Webhook<input name="wecomWebhook" type="password" placeholder={settings?.wecomConfigured ? "已配置，留空保持原值" : "https://qyapi.weixin.qq.com/..."} /></label>
+              <label>飞书 Webhook<input name="feishuWebhook" type="password" placeholder={settings?.feishuConfigured ? "已配置，留空保持原值" : "https://open.feishu.cn/..."} /></label>
+              <label className="check-line"><input name="notifyEnabled" type="checkbox" defaultChecked={settings?.notifyEnabled ?? true} /> 开启自动推送</label>
+              <button className="primary-button full" type="submit">保存告警配置</button>
+              <button className="text-button left" type="button" onClick={() => void handleTestWebhook("feishu")}>测试飞书</button>
+            </form>
           </article>
         </section>
+
+        {!auth.totpEnabled && (
+          <section className="panel security-panel">
+            <div className="section-head compact">
+              <h2>安全</h2>
+              <button className="text-button" onClick={handleSetupTwofa}>绑定 2FA</button>
+            </div>
+            {twofaSetup && (
+              <form className="twofa-box" onSubmit={handleConfirmTwofa}>
+                <code>{twofaSetup.secret}</code>
+                <a href={twofaSetup.otpauth_uri}>打开 otpauth 链接</a>
+                <label>验证码<input value={twofaCode} onChange={(event) => setTwofaCode(event.target.value)} inputMode="numeric" required /></label>
+                <button className="primary-button full" type="submit">确认绑定</button>
+              </form>
+            )}
+          </section>
+        )}
       </main>
 
       {drawerMode && (
@@ -391,6 +623,7 @@ function App() {
                 <label>URL<input value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} required placeholder="https://example.com/" /></label>
                 <label>账号<input value={draft.username} onChange={(event) => setDraft({ ...draft, username: event.target.value })} required /></label>
                 <label>密码<input value={draft.password} onChange={(event) => setDraft({ ...draft, password: event.target.value })} required type="password" /></label>
+                <label>New API 2FA 验证码<input value={draft.totp} onChange={(event) => setDraft({ ...draft, totp: event.target.value })} inputMode="numeric" autoComplete="one-time-code" /></label>
                 <div className="form-grid">
                   <label>余额比例<input value={draft.cnyRate} onChange={(event) => setDraft({ ...draft, cnyRate: event.target.value })} type="number" step="0.0001" /></label>
                   <label>阈值<input value={draft.thresholdCny} onChange={(event) => setDraft({ ...draft, thresholdCny: event.target.value })} type="number" step="0.01" /></label>

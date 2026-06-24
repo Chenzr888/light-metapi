@@ -15,6 +15,7 @@ export const initialChannels: Channel[] = [
     lastCheckedAt: "2026-06-24T02:01:34+08:00",
     rechargeUrl: "http://191.101.132.214:3000/console/topup",
     bossRechargeRequired: false,
+    enabled: true,
     history: [2241, 2252, 2248, 2260, 2266, 2264, 2267],
   },
   {
@@ -31,6 +32,7 @@ export const initialChannels: Channel[] = [
     lastCheckedAt: "2026-06-24T02:01:22+08:00",
     rechargeUrl: "https://api.fastcc.ai/console/topup",
     bossRechargeRequired: false,
+    enabled: true,
     history: [401, 395, 388, 382, 375, 368, 362],
   },
   {
@@ -47,6 +49,7 @@ export const initialChannels: Channel[] = [
     lastCheckedAt: "2026-06-24T02:01:19+08:00",
     rechargeUrl: "https://code.azsheen.top/purchase",
     bossRechargeRequired: true,
+    enabled: true,
     history: [612, 610, 602, 588, 575, 566, 559],
   },
   {
@@ -63,6 +66,7 @@ export const initialChannels: Channel[] = [
     lastCheckedAt: "2026-06-24T02:01:18+08:00",
     rechargeUrl: "https://apigate.amlkcloud.top/console/topup",
     bossRechargeRequired: false,
+    enabled: true,
     history: [150, 139, 128, 117, 105, 93, 81],
   },
   {
@@ -79,6 +83,7 @@ export const initialChannels: Channel[] = [
     lastCheckedAt: "2026-06-24T02:01:11+08:00",
     rechargeUrl: "https://nx.musingdrift.com/console/topup",
     bossRechargeRequired: false,
+    enabled: true,
     message: "上游响应超时，保留上次余额",
     history: [290, 289, 288, 286, 285, 284, 283],
   },

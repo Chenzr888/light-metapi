@@ -65,6 +65,21 @@ app.config.update(
 refresh_lock = threading.Lock()
 
 
+class UbMethodOverrideMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        override = environ.get("HTTP_X_UB_METHOD", "")
+        if path.startswith("/_ub_api/") and override:
+            environ["REQUEST_METHOD"] = override.upper()
+        return self.app(environ, start_response)
+
+
+app.wsgi_app = UbMethodOverrideMiddleware(app.wsgi_app)
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 

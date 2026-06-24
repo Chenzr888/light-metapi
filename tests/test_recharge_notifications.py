@@ -101,6 +101,27 @@ class RechargeAndNotificationTest(unittest.TestCase):
                 sess["totp_enabled"] = False
             self.assertEqual(client.get("/api/channels").status_code, 200)
 
+    def test_ub_api_method_override_supports_login_post(self):
+        ts = app.now_iso()
+        username = f"method-override-{uuid.uuid4().hex}"
+        with app.db() as conn:
+            conn.execute(
+                "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
+                (username, generate_password_hash("secret123"), ts, ts),
+            )
+
+        payload = app.base64.urlsafe_b64encode(
+            app.json.dumps({"username": username, "password": "secret123"}).encode("utf-8")
+        ).decode("ascii")
+        with app.app.test_client() as client:
+            response = client.get("/_ub_api/auth/login", headers={
+                "X-UB-Method": "POST",
+                "X-UB-Payload": payload,
+            })
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        self.assertTrue(response.get_json()["data"]["authenticated"])
+
     def test_alert_threshold_uses_channel_value_then_default(self):
         self.assertEqual(str(app.alert_threshold_from("15")), "15")
         self.assertEqual(str(app.alert_threshold_from(None, "25")), "25")
