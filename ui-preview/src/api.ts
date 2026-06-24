@@ -208,7 +208,7 @@ export async function saveAlertSettings(payload: {
   }));
 }
 
-export async function testWebhook(kind: "wecom" | "feishu") {
+export async function testWebhook(kind: "wecom" | "feishu" | "email") {
   await request<unknown>(`/api/settings/test-${kind}`, { method: "POST", body: "{}" });
 }
 

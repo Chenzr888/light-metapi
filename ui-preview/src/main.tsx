@@ -366,11 +366,12 @@ function App() {
     }
   }
 
-  async function handleTestWebhook(kind: "wecom" | "feishu") {
+  async function handleTestWebhook(kind: "wecom" | "feishu" | "email") {
+    const labels = { wecom: "企业微信", feishu: "飞书", email: "邮件" };
     setSyncing(true);
     try {
       await testWebhook(kind);
-      showToast(kind === "wecom" ? "企业微信测试已发送" : "飞书测试已发送");
+      showToast(`${labels[kind]}测试已发送`);
     } catch (error) {
       showToast((error as Error).message);
     } finally {
@@ -577,7 +578,10 @@ function App() {
               <label>飞书 Webhook<input name="feishuWebhook" type="password" placeholder={settings?.feishuConfigured ? "已配置，留空保持原值" : "https://open.feishu.cn/..."} /></label>
               <label className="check-line"><input name="notifyEnabled" type="checkbox" defaultChecked={settings?.notifyEnabled ?? true} /> 开启自动推送</label>
               <button className="primary-button full" type="submit">保存告警配置</button>
-              <button className="text-button left" type="button" onClick={() => void handleTestWebhook("feishu")}>测试飞书</button>
+              <div className="alert-test-actions">
+                <button className="text-button left" type="button" onClick={() => void handleTestWebhook("feishu")}>测试飞书</button>
+                <button className="text-button left" type="button" onClick={() => void handleTestWebhook("email")}>测试邮件</button>
+              </div>
             </form>
           </article>
         </section>

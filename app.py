@@ -1870,6 +1870,21 @@ def test_feishu():
     return jsonify({"ok": True})
 
 
+@app.post("/api/settings/test-email")
+@login_required
+def test_email():
+    if not low_balance_email_configured():
+        return response_error("请先配置低余额邮箱")
+    content = "\n".join([
+        "渠道名: 邮件测试",
+        "余额: 0 CNY",
+        f"阈值: {format_money(as_float(LOW_BALANCE_ALERT_CNY))} CNY",
+    ])
+    if not post_low_balance_email("上游余额告警测试", content):
+        return response_error("邮件发送失败", 502)
+    return jsonify({"ok": True})
+
+
 @app.get("/api/channels")
 @login_required
 def api_list_channels():

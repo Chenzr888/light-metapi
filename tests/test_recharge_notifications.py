@@ -502,10 +502,64 @@ class RechargeAndNotificationTest(unittest.TestCase):
         self.assertEqual(email.call_args.args[1], content)
         setting_set.assert_called_once()
 
+    def test_email_test_requires_login_and_sends_configured_email(self):
+        ts = app.now_iso()
+        username = f"email-test-{uuid.uuid4().hex}"
+        with app.db() as conn:
+            cur = conn.execute(
+                "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
+                (username, generate_password_hash("secret123"), ts, ts),
+            )
+            user = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+
+        with app.app.test_client() as client:
+            self.assertEqual(client.post("/api/settings/test-email", json={}).status_code, 401)
+            with client.session_transaction() as sess:
+                sess["id"] = user["id"]
+                sess["username"] = user["username"]
+                sess["totp_enabled"] = False
+            with patch("app.low_balance_email_configured", return_value=True), \
+                    patch("app.post_low_balance_email", return_value=True) as email:
+                response = client.post("/api/settings/test-email", json={})
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        email.assert_called_once()
+        subject, content = email.call_args.args
+        self.assertEqual(subject, "上游余额告警测试")
+        expected = "\n".join([
+            "渠道名: 邮件测试",
+            "余额: 0 CNY",
+            f"阈值: {app.format_money(app.as_float(app.LOW_BALANCE_ALERT_CNY))} CNY",
+        ])
+        self.assertEqual(content, expected)
+
+    def test_email_test_skips_send_when_email_is_unconfigured(self):
+        ts = app.now_iso()
+        username = f"email-unconfigured-{uuid.uuid4().hex}"
+        with app.db() as conn:
+            cur = conn.execute(
+                "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
+                (username, generate_password_hash("secret123"), ts, ts),
+            )
+            user = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+
+        with app.app.test_client() as client:
+            with client.session_transaction() as sess:
+                sess["id"] = user["id"]
+                sess["username"] = user["username"]
+                sess["totp_enabled"] = False
+            with patch("app.low_balance_email_configured", return_value=False), \
+                    patch("app.post_low_balance_email") as email:
+                response = client.post("/api/settings/test-email", json={})
+
+        self.assertEqual(response.status_code, 400)
+        email.assert_not_called()
+
     def test_register_api_aliases_exposes_ub_prefix(self):
         rules = [str(rule) for rule in app.app.url_map.iter_rules() if str(rule).startswith("/_ub_api/")]
         self.assertIn("/_ub_api/auth/bootstrap", rules)
         self.assertIn("/_ub_api/settings", rules)
+        self.assertIn("/_ub_api/settings/test-email", rules)
 
 
 if __name__ == "__main__":
