@@ -4,7 +4,6 @@ import {
   AlertTriangle,
   Bell,
   CheckCircle2,
-  ChevronDown,
   CircleDollarSign,
   ExternalLink,
   Eye,
@@ -300,7 +299,7 @@ function App() {
               <span>渠道</span>
               <span>余额</span>
               <span>阈值</span>
-              <span>趋势</span>
+              <span className="trend-head">趋势</span>
               <span>操作</span>
             </div>
             {visibleChannels.map((channel) => (
@@ -321,7 +320,9 @@ function App() {
                   <strong>{money(channel.thresholdCny)} CNY</strong>
                   <span>{isLow(channel) ? "需要关注" : "安全"}</span>
                 </div>
-                <Sparkline values={channel.history} />
+                <div className="trend-cell">
+                  <Sparkline values={channel.history} />
+                </div>
                 <div className="row-actions">
                   <button className="icon-button" title="刷新" onClick={() => refreshOne(channel.id)}><RefreshCw size={17} /></button>
                   <a className="icon-button" title="充值" href={channel.rechargeUrl} target="_blank" rel="noreferrer"><ExternalLink size={17} /></a>
@@ -398,14 +399,46 @@ function App() {
                 <button className="primary-button full" type="submit"><Eye size={18} /> 测试并保存</button>
               </form>
             ) : selected ? (
-              <form className="drawer-form" onSubmit={saveSettings}>
-                <label>渠道名<input name="name" defaultValue={selected.name} /></label>
-                <label>阈值<input name="thresholdCny" type="number" step="0.01" defaultValue={selected.thresholdCny} /></label>
-                <label>余额比例<input name="cnyRate" type="number" step="0.0001" defaultValue={selected.cnyRate} /></label>
-                <label className="check-line"><input name="bossRechargeRequired" type="checkbox" defaultChecked={selected.bossRechargeRequired} /> 充值需联系老板</label>
-                <button className="primary-button full" type="submit">保存设置</button>
-                <button className="danger-button full" type="button" onClick={deleteSelected}><Trash2 size={18} /> 删除渠道</button>
-              </form>
+              <div className="drawer-stack">
+                <article className={`drawer-channel-card ${isLow(selected) ? "low" : ""}`}>
+                  <div className="channel-main">
+                    <div className="status-dot" data-status={selected.status} />
+                    <div>
+                      <strong>{selected.name}</strong>
+                      <span>{platformLabel(selected.platform)} · {selected.username}</span>
+                      <a href={selected.baseUrl} target="_blank" rel="noreferrer">{selected.baseUrl}</a>
+                    </div>
+                  </div>
+                  <div className="drawer-metrics">
+                    <div>
+                      <span>余额</span>
+                      <strong>{money(selected.balanceCny)} CNY</strong>
+                    </div>
+                    <div>
+                      <span>阈值</span>
+                      <strong>{money(selected.thresholdCny)} CNY</strong>
+                    </div>
+                  </div>
+                </article>
+
+                <form className="drawer-form settings-card" onSubmit={saveSettings}>
+                  <label>渠道名<input name="name" defaultValue={selected.name} /></label>
+                  <div className="form-grid">
+                    <label>阈值<input name="thresholdCny" type="number" step="0.01" defaultValue={selected.thresholdCny} /></label>
+                    <label>余额比例<input name="cnyRate" type="number" step="0.0001" defaultValue={selected.cnyRate} /></label>
+                  </div>
+                  <label className="check-line"><input name="bossRechargeRequired" type="checkbox" defaultChecked={selected.bossRechargeRequired} /> 充值需联系老板</label>
+                  <button className="primary-button full" type="submit">保存设置</button>
+                </form>
+
+                <section className="danger-zone">
+                  <div>
+                    <strong>删除渠道</strong>
+                    <span>会从列表移除这条渠道和它的本地记录。</span>
+                  </div>
+                  <button className="danger-button full" type="button" onClick={deleteSelected}><Trash2 size={18} /> 删除渠道</button>
+                </section>
+              </div>
             ) : null}
           </aside>
         </div>
