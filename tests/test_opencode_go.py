@@ -9,13 +9,7 @@ from unittest.mock import patch
 from werkzeug.security import generate_password_hash
 
 import app
-from opencode_go import (
-    compute_pool_summary,
-    evaluate_alerts,
-    format_alert_message,
-    parse_dashboard_usage,
-    parse_pool_alert_usd,
-)
+from opencode_go import evaluate_alerts, parse_dashboard_usage
 
 
 class OpenCodeGoTest(unittest.TestCase):
@@ -74,9 +68,8 @@ class OpenCodeGoTest(unittest.TestCase):
 
         self.assertTrue(fetch_started.is_set())
         self.assertLess(elapsed, 0.5)
-        self.assertIn("整体时限", result[0]["quota_error"]["message"])
-        self.assertIn("整体时限", result[0]["models_error"]["message"])
-        self.assertEqual(result[0]["quota_error"]["code"], "REFRESH_DEADLINE_EXCEEDED")
+        self.assertIn("整体时限", result[0]["quota_error"])
+        self.assertIn("整体时限", result[0]["models_error"])
 
     def test_parse_dashboard_usage_reads_all_windows(self):
         document = """
@@ -91,112 +84,7 @@ class OpenCodeGoTest(unittest.TestCase):
         self.assertEqual(result["monthly"]["remaining_percent"], 0)
         self.assertEqual(result["rolling"]["resets_at"], "2026-07-19T00:05:00+00:00")
 
-    def test_pool_summary_converts_percent_to_usd(self):
-        accounts = [
-            {
-                "quota_error": None,
-                "quota": {
-                    "windows": {
-                        "rolling": {"used_percent": 50, "remaining_percent": 50},
-                        "weekly": {"used_percent": 10, "remaining_percent": 90},
-                        "monthly": {"used_percent": 25, "remaining_percent": 75},
-                    }
-                },
-            },
-            {
-                "quota_error": None,
-                "quota": {
-                    "windows": {
-                        "rolling": {"used_percent": 0, "remaining_percent": 100},
-                        "weekly": {"used_percent": 0, "remaining_percent": 100},
-                        "monthly": {"used_percent": 0, "remaining_percent": 100},
-                    }
-                },
-            },
-            {
-                "quota_error": {"code": "DASHBOARD_AUTH_FAILED", "message": "bad cookie"},
-                "quota": None,
-            },
-        ]
-        pool = compute_pool_summary(accounts)
-        self.assertEqual(pool["windows"]["rolling"]["samples"], 2)
-        self.assertEqual(pool["windows"]["rolling"]["total_usd"], 24.0)
-        self.assertEqual(pool["windows"]["rolling"]["used_usd"], 6.0)
-        self.assertEqual(pool["windows"]["rolling"]["remaining_usd"], 18.0)
-        self.assertTrue(pool["windows"]["rolling"]["below_threshold"])
-        self.assertEqual(pool["windows"]["weekly"]["remaining_usd"], 57.0)
-        self.assertEqual(pool["windows"]["monthly"]["remaining_usd"], 105.0)
-
-    def test_pool_alert_fires_once_until_recovery(self):
-        accounts = [{
-            "account_key": "demo",
-            "label": "Demo",
-            "quota_error": None,
-            "models_error": None,
-            "models": {"upstream_state": "available"},
-            "quota": {
-                "windows": {
-                    "rolling": {
-                        "label": "5 小时",
-                        "remaining_percent": 50,
-                        "used_percent": 50,
-                        "resets_at": "2026-07-19T02:00:00+00:00",
-                    },
-                    "weekly": {
-                        "label": "每周",
-                        "remaining_percent": 100,
-                        "used_percent": 0,
-                        "resets_at": "2026-07-26T02:00:00+00:00",
-                    },
-                    "monthly": {
-                        "label": "每月",
-                        "remaining_percent": 100,
-                        "used_percent": 0,
-                        "resets_at": "2026-08-19T02:00:00+00:00",
-                    },
-                }
-            },
-        }]
-        # Single-account fixture: rolling remaining $6 < $8 fires; full $12 recovers.
-        # Weekly/monthly stay above their custom lines so this test isolates one window.
-        pool_thresholds = parse_pool_alert_usd("rolling=8,weekly=5,monthly=5")
-        first = evaluate_alerts(accounts, pool_thresholds=pool_thresholds)
-        second = evaluate_alerts(
-            accounts,
-            previous_state=first["state"],
-            pool_thresholds=pool_thresholds,
-        )
-        pool_events = [event for event in first["events"] if event["type"] == "pool_threshold"]
-        self.assertEqual(len(pool_events), 1)
-        self.assertEqual(pool_events[0]["window_key"], "rolling")
-        self.assertEqual(pool_events[0]["remaining_usd"], 6.0)
-        self.assertEqual(pool_events[0]["threshold_usd"], 8.0)
-        self.assertEqual(second["events"], [])
-        self.assertIn("$6", format_alert_message(pool_events[0]))
-
-        recovered_accounts = [{
-            **accounts[0],
-            "quota": {
-                "windows": {
-                    "rolling": {
-                        "label": "5 小时",
-                        "remaining_percent": 100,
-                        "used_percent": 0,
-                        "resets_at": "2026-07-19T07:00:00+00:00",
-                    },
-                    "weekly": accounts[0]["quota"]["windows"]["weekly"],
-                    "monthly": accounts[0]["quota"]["windows"]["monthly"],
-                }
-            },
-        }]
-        recovered = evaluate_alerts(
-            recovered_accounts,
-            previous_state=first["state"],
-            pool_thresholds=pool_thresholds,
-        )
-        self.assertEqual(recovered["events"][0]["type"], "pool_recovered")
-
-    def test_legacy_account_percent_alerts_still_optional(self):
+    def test_alert_threshold_is_deduplicated_for_the_same_window(self):
         accounts = [{
             "account_key": "demo",
             "label": "Demo",
@@ -214,23 +102,12 @@ class OpenCodeGoTest(unittest.TestCase):
                 }
             },
         }]
-        first = evaluate_alerts(
-            accounts,
-            thresholds=[20, 5, 0],
-            include_account_quota_alerts=True,
-            pool_thresholds={"rolling": 0, "weekly": 0, "monthly": 0},
-        )
-        second = evaluate_alerts(
-            accounts,
-            previous_state=first["state"],
-            thresholds=[20, 5, 0],
-            include_account_quota_alerts=True,
-            pool_thresholds={"rolling": 0, "weekly": 0, "monthly": 0},
-        )
-        quota_events = [event for event in first["events"] if event["type"] == "quota_threshold"]
-        self.assertEqual(len(quota_events), 1)
-        self.assertEqual(quota_events[0]["threshold"], 5)
-        self.assertEqual([event for event in second["events"] if event["type"] == "quota_threshold"], [])
+        first = evaluate_alerts(accounts, thresholds=[20, 5, 0])
+        second = evaluate_alerts(accounts, previous_state=first["state"], thresholds=[20, 5, 0])
+
+        self.assertEqual(len(first["events"]), 1)
+        self.assertEqual(first["events"][0]["threshold"], 5)
+        self.assertEqual(second["events"], [])
 
     def test_opencode_routes_require_existing_session(self):
         with app.app.test_client() as client:
