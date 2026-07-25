@@ -68,26 +68,6 @@ export interface OpenCodeWindow {
   resetsAt: string;
 }
 
-export interface OpenCodePoolWindow {
-  key: string;
-  label: string;
-  capUsd: number;
-  usedUsd: number;
-  remainingUsd: number;
-  totalUsd: number;
-  usedPercent: number | null;
-  remainingPercent: number | null;
-  samples: number;
-  accountCount: number;
-  alertThresholdUsd: number;
-  belowThreshold: boolean;
-}
-
-export interface OpenCodePool {
-  windows: Record<string, OpenCodePoolWindow>;
-  fetchedAt: string;
-}
-
 export interface OpenCodeErrorState {
   code: string;
   message: string;
@@ -120,17 +100,11 @@ export interface OpenCodeAccount {
   modelsError: OpenCodeErrorState | null;
 }
 
-export interface OpenCodeBundle {
-  accounts: OpenCodeAccount[];
-  pool: OpenCodePool | null;
-}
-
 export interface OpenCodeAlertStatus {
   enabled: boolean;
   running: boolean;
   intervalSeconds: number;
   thresholds: number[];
-  poolThresholdsUsd: Record<string, number>;
   lastRunAt: string | null;
   lastSuccessAt: string | null;
   lastError: string | null;
