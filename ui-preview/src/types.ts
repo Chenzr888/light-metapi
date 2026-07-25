@@ -58,3 +58,62 @@ export interface SettingsState {
   lowBalanceAlertCny: number;
   refreshIntervalSeconds: number;
 }
+
+export interface OpenCodeWindow {
+  key: string;
+  label: string;
+  usedPercent: number;
+  remainingPercent: number;
+  resetInSeconds: number;
+  resetsAt: string;
+}
+
+export interface OpenCodeErrorState {
+  code: string;
+  message: string;
+}
+
+export interface OpenCodeAccount {
+  id: number;
+  accountKey: string;
+  label: string;
+  workspaceId: string | null;
+  quotaConfigured: boolean;
+  modelsConfigured: boolean;
+  hasAuthCookie: boolean;
+  hasApiKey: boolean;
+  apiKeyHint: string | null;
+  enabled: boolean;
+  quota: {
+    windows: Record<string, OpenCodeWindow>;
+    fetchedAt: string;
+    cache?: { status: string; ageSeconds: number; warning?: string };
+  } | null;
+  quotaError: OpenCodeErrorState | null;
+  models: {
+    count: number;
+    keyValid: boolean;
+    upstreamState: string;
+    fetchedAt: string;
+    cache?: { status: string; ageSeconds: number; warning?: string };
+  } | null;
+  modelsError: OpenCodeErrorState | null;
+}
+
+export interface OpenCodeAlertStatus {
+  enabled: boolean;
+  running: boolean;
+  intervalSeconds: number;
+  thresholds: number[];
+  lastRunAt: string | null;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  deliveredEvents: number;
+}
+
+export interface OpenCodeDraft {
+  label: string;
+  workspaceId: string;
+  authCookie: string;
+  apiKey: string;
+}

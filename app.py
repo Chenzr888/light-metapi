@@ -10,6 +10,8 @@ import sqlite3
 import struct
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.message import EmailMessage
@@ -22,9 +24,20 @@ from cryptography.fernet import Fernet
 from flask import Flask, jsonify, request, send_from_directory, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from opencode_go import (
+    OpenCodeError,
+    evaluate_alerts as evaluate_opencode_alerts,
+    fetch_dashboard_quota as fetch_opencode_quota,
+    fetch_models as fetch_opencode_models,
+    format_alert_message as format_opencode_alert_message,
+    mask_api_key as mask_opencode_api_key,
+    parse_alert_thresholds,
+    public_error as public_opencode_error,
+)
+
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.getenv("UPSTREAM_BALANCE_DATA_DIR", str(ROOT / "data"))).resolve()
 DB_PATH = DATA_DIR / "upstreams.sqlite3"
 KEY_PATH = DATA_DIR / "secret.key"
 SESSION_KEY_PATH = DATA_DIR / "session.secret"
@@ -43,10 +56,20 @@ LOW_BALANCE_EMAIL_SMTP_SERVER = os.getenv("LOW_BALANCE_EMAIL_SMTP_SERVER", "smtp
 LOW_BALANCE_EMAIL_SMTP_PORT = int(os.getenv("LOW_BALANCE_EMAIL_SMTP_PORT", "2587"))
 LOW_BALANCE_EMAIL_SMTP_USER = os.getenv("LOW_BALANCE_EMAIL_SMTP_USER", "resend")
 LOW_BALANCE_EMAIL_SMTP_TOKEN = os.getenv("LOW_BALANCE_EMAIL_SMTP_TOKEN", "")
+OPENCODE_GO_ORIGIN = os.getenv("OPENCODE_GO_ORIGIN", "https://opencode.ai").rstrip("/")
+OPENCODE_GO_ALERT_INTERVAL_SECONDS = max(30, int(os.getenv("OPENCODE_GO_ALERT_INTERVAL_SECONDS", "60")))
+OPENCODE_GO_ALERT_THRESHOLDS = parse_alert_thresholds(os.getenv("OPENCODE_GO_ALERT_THRESHOLDS", "20,5,0"))
+OPENCODE_GO_REFRESH_DEADLINE_SECONDS = max(
+    5, int(os.getenv("OPENCODE_GO_REFRESH_DEADLINE_SECONDS", "50"))
+)
+OPENCODE_GO_IMPORT_FILE = Path(
+    os.getenv("OPENCODE_GO_IMPORT_FILE", str(DATA_DIR / "opencode-import.json"))
+)
 
 
 def read_or_create_secret(path, size=32):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(DATA_DIR, 0o700)
     if not path.exists():
         path.write_bytes(secrets.token_bytes(size))
         os.chmod(path, 0o600)
@@ -60,9 +83,25 @@ app.config.update(
     SESSION_COOKIE_PATH=os.getenv("SESSION_COOKIE_PATH", "/"),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "0") == "1",
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
 )
 refresh_lock = threading.Lock()
+opencode_cache = {}
+opencode_cache_lock = threading.Lock()
+opencode_refresh_lock = threading.Lock()
+opencode_alert_lock = threading.Lock()
+opencode_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="opencode-go")
+opencode_alert_status = {
+    "enabled": False,
+    "running": False,
+    "interval_seconds": OPENCODE_GO_ALERT_INTERVAL_SECONDS,
+    "thresholds": OPENCODE_GO_ALERT_THRESHOLDS,
+    "last_run_at": None,
+    "last_success_at": None,
+    "last_error": None,
+    "delivered_events": 0,
+}
 
 
 class UbMethodOverrideMiddleware:
@@ -80,12 +119,17 @@ class UbMethodOverrideMiddleware:
 app.wsgi_app = UbMethodOverrideMiddleware(app.wsgi_app)
 
 
+class OpenCodeRefreshBusy(RuntimeError):
+    pass
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
 def ensure_data_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(DATA_DIR, 0o700)
 
 
 def get_cipher():
@@ -110,14 +154,17 @@ def decrypt(value):
 
 def db():
     ensure_data_dir()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    os.chmod(DB_PATH, 0o600)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 10000")
     return conn
 
 
 def init_db():
     with db() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS channels (
@@ -240,6 +287,21 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS opencode_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_key TEXT NOT NULL UNIQUE,
+                label TEXT NOT NULL,
+                workspace_id TEXT NOT NULL DEFAULT '',
+                auth_cookie_enc TEXT NOT NULL DEFAULT '',
+                api_key_enc TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
 
 
 def ensure_column(conn, table, column, column_type):
@@ -294,6 +356,352 @@ def public_settings():
         "low_balance_alert_cny": as_float(LOW_BALANCE_ALERT_CNY),
         "low_balance_alert_cooldown_seconds": LOW_BALANCE_ALERT_COOLDOWN_SECONDS,
     }
+
+
+def validate_opencode_workspace_id(value):
+    workspace_id = str(value or "").strip()
+    if workspace_id and not re.fullmatch(r"wrk_[A-Za-z0-9]+", workspace_id):
+        raise ValueError("Workspace ID 格式应为 wrk_ 开头的字母数字串")
+    return workspace_id
+
+
+def normalize_opencode_account_key(value, fallback="account"):
+    account_key = re.sub(r"[^a-z0-9_-]+", "-", str(value or "").strip().lower()).strip("-_")
+    account_key = (account_key or fallback)[:40]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,39}", account_key):
+        raise ValueError("账号 ID 需要使用小写字母、数字、下划线或连字符")
+    return account_key
+
+
+def unique_opencode_account_key(conn, preferred):
+    candidate = preferred
+    suffix = 2
+    while conn.execute("SELECT 1 FROM opencode_accounts WHERE account_key = ?", (candidate,)).fetchone():
+        ending = f"-{suffix}"
+        candidate = f"{preferred[:40 - len(ending)]}{ending}"
+        suffix += 1
+    return candidate
+
+
+def list_opencode_account_rows(enabled_only=False):
+    where = "WHERE enabled = 1" if enabled_only else ""
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM opencode_accounts {where} ORDER BY id ASC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_opencode_account(account_id):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM opencode_accounts WHERE id = ?", (account_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def public_opencode_account(row):
+    api_key = decrypt(row.get("api_key_enc", "")) if row.get("api_key_enc") else ""
+    workspace_id = row.get("workspace_id") or ""
+    has_auth_cookie = bool(row.get("auth_cookie_enc"))
+    has_api_key = bool(api_key)
+    return {
+        "id": row["id"],
+        "account_key": row["account_key"],
+        "label": row["label"],
+        "workspace_id": workspace_id or None,
+        "quota_configured": bool(workspace_id and has_auth_cookie),
+        "models_configured": has_api_key,
+        "has_auth_cookie": has_auth_cookie,
+        "has_api_key": has_api_key,
+        "api_key_hint": mask_opencode_api_key(api_key),
+        "enabled": bool(row.get("enabled", 1)),
+        "quota": None,
+        "quota_error": None,
+        "models": None,
+        "models_error": None,
+    }
+
+
+def clear_opencode_cache(account_id=None):
+    with opencode_cache_lock:
+        if account_id is None:
+            opencode_cache.clear()
+            return
+        suffix = f":{account_id}"
+        for key in [item for item in opencode_cache if item.endswith(suffix)]:
+            opencode_cache.pop(key, None)
+
+
+def opencode_secret_fingerprint(*values):
+    raw = "\0".join(str(value or "") for value in values)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def opencode_cached_value(bucket, fingerprint, ttl_seconds, stale_seconds, force, loader):
+    with opencode_cache_lock:
+        cached = deepcopy(opencode_cache.get(bucket))
+    age = time.time() - cached["stored_at"] if cached else float("inf")
+    if not force and cached and cached["fingerprint"] == fingerprint and age < ttl_seconds:
+        value = deepcopy(cached["value"])
+        value["cache"] = {"status": "fresh", "age_seconds": int(age)}
+        return value
+    try:
+        value = loader()
+        with opencode_cache_lock:
+            opencode_cache[bucket] = {
+                "fingerprint": fingerprint,
+                "stored_at": time.time(),
+                "value": deepcopy(value),
+            }
+        result = deepcopy(value)
+        result["cache"] = {"status": "live", "age_seconds": 0}
+        return result
+    except Exception as exc:
+        if cached and cached["fingerprint"] == fingerprint and age < stale_seconds:
+            value = deepcopy(cached["value"])
+            value["cache"] = {
+                "status": "stale",
+                "age_seconds": int(age),
+                "warning": str(exc),
+            }
+            return value
+        raise
+
+
+def fetch_opencode_account_part(row, kind, force=False):
+    account_id = row["id"]
+    if kind == "quota":
+        workspace_id = row.get("workspace_id") or ""
+        auth_cookie = decrypt(row.get("auth_cookie_enc", ""))
+        fingerprint = opencode_secret_fingerprint(workspace_id, auth_cookie)
+        return opencode_cached_value(
+            f"quota:{account_id}",
+            fingerprint,
+            ttl_seconds=45,
+            stale_seconds=600,
+            force=force,
+            loader=lambda: fetch_opencode_quota(
+                workspace_id,
+                auth_cookie,
+                origin=OPENCODE_GO_ORIGIN,
+                timeout=REQUEST_TIMEOUT,
+            ),
+        )
+    api_key = decrypt(row.get("api_key_enc", ""))
+    fingerprint = opencode_secret_fingerprint(api_key)
+    return opencode_cached_value(
+        f"models:{account_id}",
+        fingerprint,
+        ttl_seconds=600,
+        stale_seconds=3600,
+        force=force,
+        loader=lambda: fetch_opencode_models(
+            api_key,
+            origin=OPENCODE_GO_ORIGIN,
+            timeout=REQUEST_TIMEOUT,
+        ),
+    )
+
+
+def load_opencode_accounts(force=False, deadline_seconds=None, reject_if_busy=False):
+    acquired = opencode_refresh_lock.acquire(blocking=not reject_if_busy)
+    if not acquired:
+        raise OpenCodeRefreshBusy("OpenCode Go 正在刷新，请稍后重试")
+    try:
+        return _load_opencode_accounts(force=force, deadline_seconds=deadline_seconds)
+    finally:
+        opencode_refresh_lock.release()
+
+
+def _load_opencode_accounts(force=False, deadline_seconds=None):
+    rows = list_opencode_account_rows(enabled_only=True)
+    states = [public_opencode_account(row) for row in rows]
+    futures = {}
+    for index, row in enumerate(rows):
+        if states[index]["quota_configured"]:
+            future = opencode_executor.submit(fetch_opencode_account_part, row, "quota", force)
+            futures[future] = (index, "quota")
+        if states[index]["models_configured"]:
+            future = opencode_executor.submit(fetch_opencode_account_part, row, "models", force)
+            futures[future] = (index, "models")
+    deadline = OPENCODE_GO_REFRESH_DEADLINE_SECONDS if deadline_seconds is None else max(0, deadline_seconds)
+    completed, pending = wait(futures, timeout=deadline)
+    for future in completed:
+        index, kind = futures[future]
+        try:
+            states[index][kind] = future.result()
+        except Exception as exc:
+            states[index][f"{kind}_error"] = public_opencode_error(exc)
+    for future in pending:
+        index, kind = futures[future]
+        future.cancel()
+        states[index][f"{kind}_error"] = f"刷新超过整体时限（{deadline:g} 秒），已返回其他可用结果"
+    return states
+
+
+def save_opencode_account(payload, account_id=None):
+    current = get_opencode_account(account_id) if account_id is not None else None
+    if account_id is not None and not current:
+        raise LookupError("OpenCode Go 账号不存在")
+
+    label = str(payload.get("label") or (current or {}).get("label") or "").strip()
+    if not label:
+        raise ValueError("账号名称不能为空")
+    if payload.get("clear_workspace_id"):
+        workspace_id = ""
+    else:
+        workspace_id = validate_opencode_workspace_id(
+            payload.get("workspace_id", (current or {}).get("workspace_id", ""))
+        )
+
+    current_auth_cookie = decrypt(current.get("auth_cookie_enc", "")) if current else ""
+    current_api_key = decrypt(current.get("api_key_enc", "")) if current else ""
+    incoming_auth_cookie = str(payload.get("auth_cookie") or "").strip()
+    incoming_api_key = str(payload.get("api_key") or "").strip()
+    auth_cookie = "" if payload.get("clear_auth_cookie") else incoming_auth_cookie or current_auth_cookie
+    api_key = "" if payload.get("clear_api_key") else incoming_api_key or current_api_key
+    if not workspace_id and not auth_cookie and not api_key:
+        raise ValueError("请至少配置 Workspace、auth Cookie 或 API key")
+    enabled = 1 if payload.get("enabled", (current or {}).get("enabled", 1)) else 0
+    ts = now_iso()
+    with db() as conn:
+        if current:
+            conn.execute(
+                """
+                UPDATE opencode_accounts
+                SET label = ?, workspace_id = ?, auth_cookie_enc = ?, api_key_enc = ?, enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (label, workspace_id, encrypt(auth_cookie), encrypt(api_key), enabled, ts, account_id),
+            )
+            saved_id = account_id
+        else:
+            preferred = normalize_opencode_account_key(payload.get("account_key") or label, "account")
+            account_key = unique_opencode_account_key(conn, preferred)
+            cur = conn.execute(
+                """
+                INSERT INTO opencode_accounts(
+                    account_key, label, workspace_id, auth_cookie_enc, api_key_enc,
+                    enabled, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (account_key, label, workspace_id, encrypt(auth_cookie), encrypt(api_key), enabled, ts, ts),
+            )
+            saved_id = cur.lastrowid
+    clear_opencode_cache(saved_id)
+    return public_opencode_account(get_opencode_account(saved_id))
+
+
+def import_opencode_accounts(path=OPENCODE_GO_IMPORT_FILE):
+    import_path = Path(path)
+    if not import_path.exists():
+        return 0
+    try:
+        payload = json.loads(import_path.read_text(encoding="utf-8"))
+        accounts = payload.get("accounts") if isinstance(payload, dict) else None
+        if not isinstance(accounts, list):
+            raise ValueError("OpenCode 导入文件缺少 accounts 数组")
+        prepared = []
+        for index, account in enumerate(accounts):
+            if not isinstance(account, dict):
+                continue
+            workspace_id = validate_opencode_workspace_id(account.get("workspaceId"))
+            auth_cookie = str(account.get("authCookie") or "").strip()
+            api_key = str(account.get("apiKey") or "").strip()
+            if not workspace_id and not auth_cookie and not api_key:
+                continue
+            label = str(account.get("label") or f"账号 {index + 1}").strip() or f"账号 {index + 1}"
+            account_key = normalize_opencode_account_key(account.get("id"), f"account-{index + 1}")
+            prepared.append((account_key, label, workspace_id, auth_cookie, api_key))
+
+        with db() as conn:
+            existing = conn.execute("SELECT COUNT(*) FROM opencode_accounts").fetchone()[0]
+            if existing:
+                imported = 0
+            else:
+                imported = 0
+                ts = now_iso()
+                for account_key, label, workspace_id, auth_cookie, api_key in prepared:
+                    account_key = unique_opencode_account_key(conn, account_key)
+                    conn.execute(
+                        """
+                        INSERT INTO opencode_accounts(
+                            account_key, label, workspace_id, auth_cookie_enc, api_key_enc,
+                            enabled, created_at, updated_at
+                        ) VALUES(?, ?, ?, ?, ?, 1, ?, ?)
+                        """,
+                        (
+                            account_key,
+                            label,
+                            workspace_id,
+                            encrypt(auth_cookie),
+                            encrypt(api_key),
+                            ts,
+                            ts,
+                        ),
+                    )
+                    imported += 1
+        import_path.unlink(missing_ok=True)
+        print(f"[opencode-go] imported_accounts={imported} plaintext_import_removed=1", flush=True)
+        return imported
+    except Exception as exc:
+        print(f"[opencode-go] import failed: {exc}", flush=True)
+        return 0
+
+
+def opencode_notifications_enabled():
+    return notification_webhooks_configured() or low_balance_email_configured()
+
+
+def public_opencode_alert_status():
+    with opencode_alert_lock:
+        status = dict(opencode_alert_status)
+    status["enabled"] = opencode_notifications_enabled()
+    return status
+
+
+def deliver_opencode_event(event):
+    content = format_opencode_alert_message(event)
+    webhook_sent = post_notification_text(content) if notification_webhooks_configured() else []
+    email_sent = post_low_balance_email(content.splitlines()[0], content) if low_balance_email_configured() else False
+    return bool(webhook_sent or email_sent)
+
+
+def run_opencode_alert_monitor(force=False):
+    if not opencode_alert_lock.acquire(blocking=False):
+        return public_opencode_alert_status()
+    try:
+        opencode_alert_status["running"] = True
+        opencode_alert_status["enabled"] = opencode_notifications_enabled()
+        opencode_alert_status["last_run_at"] = now_iso()
+        if not opencode_alert_status["enabled"] and not force:
+            return dict(opencode_alert_status)
+        accounts = load_opencode_accounts(force=False)
+        try:
+            previous = json.loads(setting_get("opencode_alert_state", "{}") or "{}")
+        except json.JSONDecodeError:
+            previous = {}
+        evaluation = evaluate_opencode_alerts(
+            accounts,
+            previous_state=previous,
+            thresholds=OPENCODE_GO_ALERT_THRESHOLDS,
+        )
+        delivered = 0
+        for event in evaluation["events"]:
+            if not deliver_opencode_event(event):
+                raise RuntimeError("OpenCode Go 告警通道发送失败")
+            delivered += 1
+        setting_set("opencode_alert_state", json.dumps(evaluation["state"], ensure_ascii=False))
+        opencode_alert_status["last_success_at"] = now_iso()
+        opencode_alert_status["last_error"] = None
+        opencode_alert_status["delivered_events"] += delivered
+    except Exception as exc:
+        opencode_alert_status["last_error"] = str(exc)
+        print(f"[opencode-go] alert monitor failed: {exc}", flush=True)
+    finally:
+        opencode_alert_status["running"] = False
+        status = dict(opencode_alert_status)
+        opencode_alert_lock.release()
+    return status
 
 
 def normalize_url(base_url):
@@ -1719,7 +2127,12 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify({"ok": True, "time": now_iso()})
+    try:
+        with db() as conn:
+            conn.execute("SELECT 1").fetchone()
+        return jsonify({"ok": True, "database": "ready", "time": now_iso()})
+    except Exception:
+        return jsonify({"ok": False, "database": "unavailable", "time": now_iso()}), 503
 
 
 @app.get("/api/auth/bootstrap")
@@ -1811,6 +2224,76 @@ def auth_2fa_disable():
 @login_required
 def get_settings():
     return jsonify({"ok": True, "data": public_settings()})
+
+
+@app.get("/api/opencode/accounts")
+@login_required
+def api_opencode_accounts():
+    force = request.args.get("refresh") == "1"
+    try:
+        data = load_opencode_accounts(force=force, reject_if_busy=True)
+    except OpenCodeRefreshBusy as exc:
+        return response_error(str(exc), 409)
+    return jsonify({"ok": True, "data": data, "fetched_at": now_iso()})
+
+
+@app.post("/api/opencode/accounts")
+@login_required
+def api_create_opencode_account():
+    try:
+        account = save_opencode_account(request_payload(force=True))
+    except ValueError as exc:
+        return response_error(str(exc))
+    return jsonify({"ok": True, "data": account})
+
+
+@app.put("/api/opencode/accounts/<int:account_id>")
+@login_required
+def api_update_opencode_account(account_id):
+    try:
+        account = save_opencode_account(request_payload(force=True), account_id=account_id)
+    except LookupError as exc:
+        return response_error(str(exc), 404)
+    except ValueError as exc:
+        return response_error(str(exc))
+    return jsonify({"ok": True, "data": account})
+
+
+@app.delete("/api/opencode/accounts/<int:account_id>")
+@login_required
+def api_delete_opencode_account(account_id):
+    if not get_opencode_account(account_id):
+        return response_error("OpenCode Go 账号不存在", 404)
+    with db() as conn:
+        conn.execute("DELETE FROM opencode_accounts WHERE id = ?", (account_id,))
+    clear_opencode_cache(account_id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/opencode/refresh")
+@login_required
+def api_refresh_opencode_accounts():
+    try:
+        data = load_opencode_accounts(force=True, reject_if_busy=True)
+    except OpenCodeRefreshBusy as exc:
+        return response_error(str(exc), 409)
+    return jsonify({"ok": True, "data": data, "fetched_at": now_iso()})
+
+
+@app.get("/api/opencode/alerts")
+@login_required
+def api_opencode_alerts():
+    return jsonify({"ok": True, "data": public_opencode_alert_status()})
+
+
+@app.post("/api/opencode/alerts/test")
+@login_required
+def api_test_opencode_alerts():
+    if not opencode_notifications_enabled():
+        return response_error("请先配置企业微信、飞书或低余额邮箱")
+    if not deliver_opencode_event({"type": "test"}):
+        return response_error("OpenCode Go 告警测试发送失败", 502)
+    return jsonify({"ok": True})
 
 
 @app.put("/api/settings")
@@ -2126,12 +2609,12 @@ def register_api_aliases():
         if endpoint in app.view_functions:
             continue
         methods = set(rule.methods)
-        methods.add("GET")
         app.add_url_rule(alias, endpoint, app.view_functions[rule.endpoint], methods=methods)
 
 
 def scheduler_loop():
     last_notify_at = 0.0
+    last_opencode_alert_at = 0.0
     while True:
         time.sleep(REFRESH_INTERVAL_SECONDS)
         try:
@@ -2141,6 +2624,9 @@ def scheduler_loop():
                 last_notify_at = time.time()
         except Exception as exc:
             print(f"[scheduler] refresh failed: {exc}", flush=True)
+        if time.time() - last_opencode_alert_at >= OPENCODE_GO_ALERT_INTERVAL_SECONDS:
+            run_opencode_alert_monitor()
+            last_opencode_alert_at = time.time()
 
 
 def start_scheduler():
@@ -2149,6 +2635,7 @@ def start_scheduler():
 
 
 init_db()
+import_opencode_accounts()
 register_api_aliases()
 start_scheduler()
 

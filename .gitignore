@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .venv/
 .env
+/config.json
+opencode-import*.json
 node_modules/
 dist/
 .vite/
