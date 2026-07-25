@@ -50,6 +50,9 @@ class DeployContractTest(unittest.TestCase):
         deploy_launcher = (ROOT / "scripts" / "deploy-cy16.sh").read_text()
         self.assertIn("secrets.token_hex(16)", deploy_launcher)
         self.assertIn("mkdir '$RELEASE_DIR'", deploy_launcher)
+        self.assertIn("download_ci_artifact", deploy_launcher)
+        self.assertIn("--max-connection-per-server=16", deploy_launcher)
+        self.assertNotIn("gh run download", deploy_launcher)
 
     def test_production_compose_is_bounded_and_local_only(self):
         for compose_file in ("docker-compose.cy16.yml", "docker-compose.rollback.yml"):

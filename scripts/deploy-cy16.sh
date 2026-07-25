@@ -37,7 +37,7 @@ done
 [ -n "$SHA_INPUT" ] || { usage; exit 1; }
 cd "$ROOT"
 
-for command_name in git gh docker curl python3; do
+for command_name in git gh docker curl aria2c python3; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "FATAL: missing required command: $command_name" >&2
     exit 1
@@ -133,14 +133,116 @@ cleanup() {
 }
 trap cleanup EXIT
 
+secure_delete_local() {
+  local target=${1:-}
+  [ -n "$target" ] && [ -f "$target" ] || return 0
+  python3 - "$target" <<'PY'
+import os, sys
+path=sys.argv[1]
+size=os.path.getsize(path)
+with open(path, "r+b", buffering=0) as handle:
+    handle.write(b"\0" * size)
+    handle.flush()
+    os.fsync(handle.fileno())
+os.unlink(path)
+PY
+}
+
+download_ci_artifact() {
+  local artifact_name=$1 output_dir=$2 metadata artifact_meta artifact_id expected_size
+  local header_file zip_file aria_log github_token signed_url http_code actual_size
+  metadata=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts?per_page=100") || return 1
+  artifact_meta=$(ARTIFACT_METADATA="$metadata" python3 - "$artifact_name" <<'PY'
+import json, os, sys
+name=sys.argv[1]
+matches=[item for item in json.loads(os.environ["ARTIFACT_METADATA"]).get("artifacts", [])
+         if item.get("name") == name and not item.get("expired")]
+if len(matches) != 1:
+    raise SystemExit(f"FATAL: expected one live CI artifact named {name}, found {len(matches)}")
+item=matches[0]
+print(f'{item["id"]}|{item["size_in_bytes"]}')
+PY
+) || return 1
+  IFS='|' read -r artifact_id expected_size <<< "$artifact_meta"
+  [[ "$artifact_id" =~ ^[0-9]+$ ]] && [[ "$expected_size" =~ ^[0-9]+$ ]] || return 1
+
+  mkdir -p "$output_dir" || return 1
+  chmod 700 "$output_dir" || return 1
+  header_file="$PACKAGE_DIR/artifact-response.headers"
+  zip_file="$PACKAGE_DIR/$artifact_name.zip"
+  aria_log="$PACKAGE_DIR/artifact-download.log"
+  github_token=$(gh auth token) || return 1
+  http_code=$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+    --dump-header "$header_file" --output /dev/null --write-out '%{http_code}' \
+    --header "Authorization: Bearer $github_token" \
+    --header 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/$REPO/actions/artifacts/$artifact_id/zip") || {
+      unset github_token
+      secure_delete_local "$header_file" || true
+      return 1
+    }
+  unset github_token
+  [ "$http_code" = "302" ] || {
+    secure_delete_local "$header_file" || true
+    echo "FATAL: artifact API returned HTTP $http_code instead of a signed download redirect" >&2
+    return 1
+  }
+  signed_url=$(python3 - "$header_file" <<'PY'
+import pathlib, sys
+locations=[]
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    if line.lower().startswith("location:"):
+        locations.append(line.split(":", 1)[1].strip())
+if len(locations) != 1 or not locations[0].startswith("https://"):
+    raise SystemExit("FATAL: artifact API did not return one HTTPS download URL")
+print(locations[0])
+PY
+) || {
+    secure_delete_local "$header_file" || true
+    return 1
+  }
+  secure_delete_local "$header_file" || return 1
+  chmod 600 "$aria_log" 2>/dev/null || true
+  if ! printf '%s\n' "$signed_url" | \
+    aria2c --quiet=true --console-log-level=error --file-allocation=none \
+      --max-connection-per-server=16 --split=16 --min-split-size=1M \
+      --dir="$PACKAGE_DIR" --out="$artifact_name.zip" --input-file=- \
+      > "$aria_log" 2>&1; then
+    unset signed_url
+    secure_delete_local "$aria_log" || true
+    echo "FATAL: parallel CI artifact download failed" >&2
+    return 1
+  fi
+  unset signed_url
+  secure_delete_local "$aria_log" || true
+  actual_size=$(stat -c '%s' "$zip_file") || return 1
+  [ "$actual_size" = "$expected_size" ] || {
+    echo "FATAL: artifact size mismatch: expected=$expected_size actual=$actual_size" >&2
+    return 1
+  }
+  python3 - "$zip_file" "$artifact_name" "$output_dir/light-metapi-image.tar.gz" <<'PY' || return 1
+import os, pathlib, shutil, sys, zipfile
+archive=pathlib.Path(sys.argv[1])
+expected=sys.argv[2]
+target=pathlib.Path(sys.argv[3])
+with zipfile.ZipFile(archive) as bundle:
+    files=[item for item in bundle.infolist() if not item.is_dir()]
+    if len(files) != 1 or pathlib.PurePosixPath(files[0].filename).name != "light-metapi-image.tar.gz":
+        raise SystemExit(f"FATAL: unexpected files in CI artifact {expected}")
+    with bundle.open(files[0]) as source, target.open("xb") as output:
+        shutil.copyfileobj(source, output)
+os.chmod(target, 0o600)
+PY
+  find "$zip_file" -maxdepth 0 -type f -delete || return 1
+}
+
 git archive "$RELEASE_SHA" \
   deploy/docker-compose.cy16.yml deploy/docker-compose.rollback.yml \
   scripts/validate-compose-policy.py scripts/remote-deploy-cy16.sh \
   scripts/remote-rollback-cy16.sh scripts/remote-run-cy16.sh \
   scripts/remote-run-rollback-cy16.sh | tar -xf - -C "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR/artifact"
-gh run download "$RUN_ID" --repo "$REPO" \
-  --name "light-metapi-image-$RELEASE_SHA" --dir "$PACKAGE_DIR/artifact"
+download_ci_artifact "light-metapi-image-$RELEASE_SHA" "$PACKAGE_DIR/artifact"
 IMAGE_ARCHIVE="$PACKAGE_DIR/artifact/light-metapi-image.tar.gz"
 [ -f "$IMAGE_ARCHIVE" ] || { echo "FATAL: tested image artifact is missing" >&2; exit 1; }
 IMAGE_ARCHIVE_SHA256=$(sha256sum "$IMAGE_ARCHIVE" | awk '{print $1}')
