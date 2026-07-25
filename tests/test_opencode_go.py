@@ -46,20 +46,28 @@ class OpenCodeGoTest(unittest.TestCase):
             "models_error": None,
         }
 
+        fetch_started = Event()
+        release_fetch = Event()
+
         def slow_fetch(*_args, **_kwargs):
-            time.sleep(0.15)
+            fetch_started.set()
+            release_fetch.wait(timeout=2)
             return {"ok": True}
 
-        started = time.monotonic()
-        with (
-            patch.object(app, "list_opencode_account_rows", return_value=[{"id": 1}]),
-            patch.object(app, "public_opencode_account", return_value=state.copy()),
-            patch.object(app, "fetch_opencode_account_part", side_effect=slow_fetch),
-        ):
-            result = app.load_opencode_accounts(force=True, deadline_seconds=0.02)
-        elapsed = time.monotonic() - started
+        try:
+            started = time.monotonic()
+            with (
+                patch.object(app, "list_opencode_account_rows", return_value=[{"id": 1}]),
+                patch.object(app, "public_opencode_account", return_value=state.copy()),
+                patch.object(app, "fetch_opencode_account_part", side_effect=slow_fetch),
+            ):
+                result = app.load_opencode_accounts(force=True, deadline_seconds=0.02)
+            elapsed = time.monotonic() - started
+        finally:
+            release_fetch.set()
 
-        self.assertLess(elapsed, 0.1)
+        self.assertTrue(fetch_started.is_set())
+        self.assertLess(elapsed, 0.5)
         self.assertIn("整体时限", result[0]["quota_error"])
         self.assertIn("整体时限", result[0]["models_error"])
 
