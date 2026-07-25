@@ -4,7 +4,10 @@ import type {
   DraftChannel,
   OpenCodeAccount,
   OpenCodeAlertStatus,
+  OpenCodeBundle,
   OpenCodeDraft,
+  OpenCodePool,
+  OpenCodePoolWindow,
   OpenCodeWindow,
   Platform,
   RechargeLog,
@@ -105,11 +108,37 @@ interface RawOpenCodeAccount {
   models_error: null | { code: string; message: string };
 }
 
+interface RawOpenCodePoolWindow {
+  key: string;
+  label: string;
+  cap_usd: number;
+  used_usd: number;
+  remaining_usd: number;
+  total_usd: number;
+  used_percent: number | null;
+  remaining_percent: number | null;
+  samples: number;
+  account_count: number;
+  alert_threshold_usd: number;
+  below_threshold: boolean;
+}
+
+interface RawOpenCodePool {
+  windows: Record<string, RawOpenCodePoolWindow>;
+  fetched_at: string;
+}
+
+interface RawOpenCodeBundle {
+  accounts: RawOpenCodeAccount[];
+  pool: RawOpenCodePool;
+}
+
 interface RawOpenCodeAlertStatus {
   enabled: boolean;
   running: boolean;
   interval_seconds: number;
   thresholds: number[];
+  pool_thresholds_usd?: Record<string, number>;
   last_run_at: string | null;
   last_success_at: string | null;
   last_error: string | null;
@@ -226,6 +255,33 @@ function mapOpenCodeWindow(raw: RawOpenCodeWindow): OpenCodeWindow {
   };
 }
 
+function mapOpenCodePoolWindow(raw: RawOpenCodePoolWindow): OpenCodePoolWindow {
+  return {
+    key: raw.key,
+    label: raw.label,
+    capUsd: raw.cap_usd,
+    usedUsd: raw.used_usd,
+    remainingUsd: raw.remaining_usd,
+    totalUsd: raw.total_usd,
+    usedPercent: raw.used_percent,
+    remainingPercent: raw.remaining_percent,
+    samples: raw.samples,
+    accountCount: raw.account_count,
+    alertThresholdUsd: raw.alert_threshold_usd,
+    belowThreshold: raw.below_threshold,
+  };
+}
+
+function mapOpenCodePool(raw: RawOpenCodePool | null | undefined): OpenCodePool | null {
+  if (!raw) return null;
+  return {
+    windows: Object.fromEntries(
+      Object.entries(raw.windows || {}).map(([key, value]) => [key, mapOpenCodePoolWindow(value)]),
+    ),
+    fetchedAt: raw.fetched_at,
+  };
+}
+
 function mapOpenCodeAccount(raw: RawOpenCodeAccount): OpenCodeAccount {
   const windows = Object.fromEntries(
     Object.entries(raw.quota?.windows || {}).map(([key, value]) => [key, mapOpenCodeWindow(value)]),
@@ -266,12 +322,27 @@ function mapOpenCodeAccount(raw: RawOpenCodeAccount): OpenCodeAccount {
   };
 }
 
+function mapOpenCodeBundle(raw: RawOpenCodeBundle | RawOpenCodeAccount[]): OpenCodeBundle {
+  if (Array.isArray(raw)) {
+    return { accounts: raw.map(mapOpenCodeAccount), pool: null };
+  }
+  return {
+    accounts: (raw.accounts || []).map(mapOpenCodeAccount),
+    pool: mapOpenCodePool(raw.pool),
+  };
+}
+
 function mapOpenCodeAlerts(raw: RawOpenCodeAlertStatus): OpenCodeAlertStatus {
   return {
     enabled: raw.enabled,
     running: raw.running,
     intervalSeconds: raw.interval_seconds,
     thresholds: raw.thresholds,
+    poolThresholdsUsd: raw.pool_thresholds_usd || {
+      rolling: 20,
+      weekly: 80,
+      monthly: 300,
+    },
     lastRunAt: raw.last_run_at,
     lastSuccessAt: raw.last_success_at,
     lastError: raw.last_error,
@@ -344,14 +415,14 @@ export async function loadRecharges(limit = 80) {
 
 export async function loadOpenCodeAccounts(force = false) {
   const suffix = force ? "?refresh=1" : "";
-  return (await request<RawOpenCodeAccount[]>(`/api/opencode/accounts${suffix}`)).map(mapOpenCodeAccount);
+  return mapOpenCodeBundle(await request<RawOpenCodeBundle | RawOpenCodeAccount[]>(`/api/opencode/accounts${suffix}`));
 }
 
 export async function refreshOpenCodeAccounts() {
-  return (await request<RawOpenCodeAccount[]>("/api/opencode/refresh", {
+  return mapOpenCodeBundle(await request<RawOpenCodeBundle | RawOpenCodeAccount[]>("/api/opencode/refresh", {
     method: "POST",
     body: "{}",
-  })).map(mapOpenCodeAccount);
+  }));
 }
 
 export async function loadOpenCodeAlerts() {
