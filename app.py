@@ -26,12 +26,14 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from opencode_go import (
     OpenCodeError,
+    compute_pool_summary as compute_opencode_pool_summary,
     evaluate_alerts as evaluate_opencode_alerts,
     fetch_dashboard_quota as fetch_opencode_quota,
     fetch_models as fetch_opencode_models,
     format_alert_message as format_opencode_alert_message,
     mask_api_key as mask_opencode_api_key,
     parse_alert_thresholds,
+    parse_pool_alert_usd,
     public_error as public_opencode_error,
 )
 
@@ -59,9 +61,13 @@ LOW_BALANCE_EMAIL_SMTP_TOKEN = os.getenv("LOW_BALANCE_EMAIL_SMTP_TOKEN", "")
 OPENCODE_GO_ORIGIN = os.getenv("OPENCODE_GO_ORIGIN", "https://opencode.ai").rstrip("/")
 OPENCODE_GO_ALERT_INTERVAL_SECONDS = max(30, int(os.getenv("OPENCODE_GO_ALERT_INTERVAL_SECONDS", "60")))
 OPENCODE_GO_ALERT_THRESHOLDS = parse_alert_thresholds(os.getenv("OPENCODE_GO_ALERT_THRESHOLDS", "20,5,0"))
-OPENCODE_GO_REFRESH_DEADLINE_SECONDS = max(
-    5, int(os.getenv("OPENCODE_GO_REFRESH_DEADLINE_SECONDS", "50"))
+OPENCODE_GO_POOL_ALERT_USD = parse_pool_alert_usd(
+    os.getenv("OPENCODE_GO_POOL_ALERT_USD", "rolling=20,weekly=80,monthly=300")
 )
+OPENCODE_GO_REFRESH_DEADLINE_SECONDS = max(
+    5, int(os.getenv("OPENCODE_GO_REFRESH_DEADLINE_SECONDS", "90"))
+)
+OPENCODE_GO_REFRESH_WORKERS = max(4, int(os.getenv("OPENCODE_GO_REFRESH_WORKERS", "16")))
 OPENCODE_GO_IMPORT_FILE = Path(
     os.getenv("OPENCODE_GO_IMPORT_FILE", str(DATA_DIR / "opencode-import.json"))
 )
@@ -91,12 +97,16 @@ opencode_cache = {}
 opencode_cache_lock = threading.Lock()
 opencode_refresh_lock = threading.Lock()
 opencode_alert_lock = threading.Lock()
-opencode_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="opencode-go")
+opencode_executor = ThreadPoolExecutor(
+    max_workers=OPENCODE_GO_REFRESH_WORKERS,
+    thread_name_prefix="opencode-go",
+)
 opencode_alert_status = {
     "enabled": False,
     "running": False,
     "interval_seconds": OPENCODE_GO_ALERT_INTERVAL_SECONDS,
     "thresholds": OPENCODE_GO_ALERT_THRESHOLDS,
+    "pool_thresholds_usd": OPENCODE_GO_POOL_ALERT_USD,
     "last_run_at": None,
     "last_success_at": None,
     "last_error": None,
@@ -534,8 +544,24 @@ def _load_opencode_accounts(force=False, deadline_seconds=None):
     for future in pending:
         index, kind = futures[future]
         future.cancel()
-        states[index][f"{kind}_error"] = f"刷新超过整体时限（{deadline:g} 秒），已返回其他可用结果"
+        states[index][f"{kind}_error"] = public_opencode_error(
+            OpenCodeError(
+                f"刷新超过整体时限（{deadline:g} 秒），已返回其他可用结果",
+                code="REFRESH_DEADLINE_EXCEEDED",
+                status_code=504,
+            )
+        )
     return states
+
+
+def public_opencode_bundle(accounts):
+    return {
+        "accounts": accounts,
+        "pool": compute_opencode_pool_summary(
+            accounts,
+            alert_thresholds=OPENCODE_GO_POOL_ALERT_USD,
+        ),
+    }
 
 
 def save_opencode_account(payload, account_id=None):
@@ -684,6 +710,7 @@ def run_opencode_alert_monitor(force=False):
             accounts,
             previous_state=previous,
             thresholds=OPENCODE_GO_ALERT_THRESHOLDS,
+            pool_thresholds=OPENCODE_GO_POOL_ALERT_USD,
         )
         delivered = 0
         for event in evaluation["events"]:
@@ -2231,10 +2258,10 @@ def get_settings():
 def api_opencode_accounts():
     force = request.args.get("refresh") == "1"
     try:
-        data = load_opencode_accounts(force=force, reject_if_busy=True)
+        accounts = load_opencode_accounts(force=force, reject_if_busy=True)
     except OpenCodeRefreshBusy as exc:
         return response_error(str(exc), 409)
-    return jsonify({"ok": True, "data": data, "fetched_at": now_iso()})
+    return jsonify({"ok": True, "data": public_opencode_bundle(accounts), "fetched_at": now_iso()})
 
 
 @app.post("/api/opencode/accounts")
@@ -2274,10 +2301,10 @@ def api_delete_opencode_account(account_id):
 @login_required
 def api_refresh_opencode_accounts():
     try:
-        data = load_opencode_accounts(force=True, reject_if_busy=True)
+        accounts = load_opencode_accounts(force=True, reject_if_busy=True)
     except OpenCodeRefreshBusy as exc:
         return response_error(str(exc), 409)
-    return jsonify({"ok": True, "data": data, "fetched_at": now_iso()})
+    return jsonify({"ok": True, "data": public_opencode_bundle(accounts), "fetched_at": now_iso()})
 
 
 @app.get("/api/opencode/alerts")

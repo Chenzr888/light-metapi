@@ -12,6 +12,18 @@ DASHBOARD_WINDOWS = {
     "monthly": {"field": "monthlyUsage", "label": "每月"},
 }
 DEFAULT_ALERT_THRESHOLDS = [20, 5, 0]
+# Official OpenCode Go dollar caps per account (opencode.ai/docs/go).
+WINDOW_CAPS_USD = {
+    "rolling": 12.0,
+    "weekly": 30.0,
+    "monthly": 60.0,
+}
+# Pool remaining USD alert lines across all accounts with live data.
+DEFAULT_POOL_ALERT_USD = {
+    "rolling": 20.0,
+    "weekly": 80.0,
+    "monthly": 300.0,
+}
 
 
 class OpenCodeError(RuntimeError):
@@ -265,6 +277,82 @@ def parse_alert_thresholds(value=None):
     return sorted(thresholds, reverse=True)
 
 
+def parse_pool_alert_usd(value=None):
+    """Parse `rolling=20,weekly=80,monthly=300` (or bare defaults)."""
+    result = dict(DEFAULT_POOL_ALERT_USD)
+    text = str(value or "").strip()
+    if not text:
+        return result
+    for part in text.split(","):
+        item = part.strip()
+        if not item or "=" not in item:
+            continue
+        key, raw = item.split("=", 1)
+        key = key.strip().lower()
+        if key not in WINDOW_CAPS_USD:
+            continue
+        try:
+            number = float(raw.strip())
+        except (TypeError, ValueError):
+            continue
+        if number >= 0:
+            result[key] = number
+    return result
+
+
+def round_usd(value):
+    return round(float(value), 2)
+
+
+def compute_pool_summary(accounts, caps=None, alert_thresholds=None, now=None):
+    """Convert per-account usage % into a pooled USD remaining/used view."""
+    current = now or utc_now()
+    window_caps = caps or WINDOW_CAPS_USD
+    thresholds = alert_thresholds or DEFAULT_POOL_ALERT_USD
+    account_count = len(accounts or [])
+    windows = {}
+    for key, definition in DASHBOARD_WINDOWS.items():
+        cap = float(window_caps.get(key, WINDOW_CAPS_USD[key]))
+        used_usd = 0.0
+        remaining_usd = 0.0
+        samples = 0
+        for account in accounts or []:
+            if account.get("quota_error"):
+                continue
+            window = ((account.get("quota") or {}).get("windows") or {}).get(key)
+            if not isinstance(window, dict):
+                continue
+            try:
+                used_percent = float(window.get("used_percent"))
+                remaining_percent = float(
+                    window.get("remaining_percent", max(0.0, 100.0 - used_percent))
+                )
+            except (TypeError, ValueError):
+                continue
+            used_usd += max(0.0, min(100.0, used_percent)) / 100.0 * cap
+            remaining_usd += max(0.0, min(100.0, remaining_percent)) / 100.0 * cap
+            samples += 1
+        total_usd = samples * cap
+        alert_usd = float(thresholds.get(key, DEFAULT_POOL_ALERT_USD[key]))
+        used_percent = round(used_usd / total_usd * 100.0, 1) if total_usd else None
+        remaining_percent = round(remaining_usd / total_usd * 100.0, 1) if total_usd else None
+        windows[key] = {
+            "key": key,
+            "label": definition["label"],
+            "cap_usd": round_usd(cap),
+            "used_usd": round_usd(used_usd),
+            "remaining_usd": round_usd(remaining_usd),
+            "total_usd": round_usd(total_usd),
+            "used_percent": used_percent,
+            "remaining_percent": remaining_percent,
+            "samples": samples,
+            "account_count": account_count,
+            "alert_threshold_usd": round_usd(alert_usd),
+            "below_threshold": bool(samples > 0 and remaining_usd <= alert_usd),
+        }
+    return {"windows": windows, "fetched_at": iso(current)}
+
+
 def clean_error(error):
     if not error:
         return None
@@ -287,10 +375,24 @@ def threshold_for_remaining(remaining_percent, thresholds):
     return next((threshold for threshold in candidates if remaining_percent <= threshold), None)
 
 
-def evaluate_alerts(accounts, previous_state=None, thresholds=None, now=None):
+def evaluate_alerts(
+    accounts,
+    previous_state=None,
+    thresholds=None,
+    pool_thresholds=None,
+    now=None,
+    include_account_quota_alerts=False,
+):
+    """Evaluate OpenCode alerts.
+
+    Default monitoring is pooled USD remaining (5h / week / month). Per-account
+    percentage thresholds stay available only when explicitly enabled.
+    """
     current = now or utc_now()
     levels = thresholds or DEFAULT_ALERT_THRESHOLDS
+    pool_levels = pool_thresholds or DEFAULT_POOL_ALERT_USD
     previous_accounts = (previous_state or {}).get("accounts", {})
+    previous_pool = (previous_state or {}).get("pool", {})
     next_accounts = {}
     events = []
     for account in accounts:
@@ -328,21 +430,22 @@ def evaluate_alerts(accounts, previous_state=None, thresholds=None, now=None):
             same_window = previous_window.get("reset_key") == current_reset_key
             notified = list(previous_window.get("notified_thresholds") or []) if same_window else []
             remaining = float(window.get("remaining_percent", 0))
-            threshold = threshold_for_remaining(remaining, levels)
-            if threshold is not None and threshold not in notified:
-                notified.append(threshold)
-                events.append(
-                    {
-                        "type": "quota_threshold",
-                        **common,
-                        "window_key": window_key,
-                        "window_label": window.get("label") or window_key,
-                        "threshold": threshold,
-                        "remaining_percent": remaining,
-                        "used_percent": float(window.get("used_percent", 0)),
-                        "resets_at": window.get("resets_at"),
-                    }
-                )
+            if include_account_quota_alerts:
+                threshold = threshold_for_remaining(remaining, levels)
+                if threshold is not None and threshold not in notified:
+                    notified.append(threshold)
+                    events.append(
+                        {
+                            "type": "quota_threshold",
+                            **common,
+                            "window_key": window_key,
+                            "window_label": window.get("label") or window_key,
+                            "threshold": threshold,
+                            "remaining_percent": remaining,
+                            "used_percent": float(window.get("used_percent", 0)),
+                            "resets_at": window.get("resets_at"),
+                        }
+                    )
             next_state["windows"][window_key] = {
                 "reset_key": current_reset_key,
                 "resets_at": window.get("resets_at"),
@@ -350,9 +453,57 @@ def evaluate_alerts(accounts, previous_state=None, thresholds=None, now=None):
                 "notified_thresholds": sorted(notified, reverse=True),
             }
         next_accounts[account_key] = next_state
+
+    pool = compute_pool_summary(accounts, alert_thresholds=pool_levels, now=current)
+    next_pool = {}
+    for window_key, window in (pool.get("windows") or {}).items():
+        previous_window = previous_pool.get(window_key, {})
+        was_below = bool(previous_window.get("below_threshold"))
+        is_below = bool(window.get("below_threshold"))
+        next_pool[window_key] = {
+            "below_threshold": is_below,
+            "remaining_usd": window.get("remaining_usd"),
+            "alert_threshold_usd": window.get("alert_threshold_usd"),
+            "samples": window.get("samples"),
+        }
+        if window.get("samples", 0) <= 0:
+            continue
+        if is_below and not was_below:
+            events.append(
+                {
+                    "type": "pool_threshold",
+                    "window_key": window_key,
+                    "window_label": window.get("label") or window_key,
+                    "remaining_usd": window.get("remaining_usd"),
+                    "used_usd": window.get("used_usd"),
+                    "total_usd": window.get("total_usd"),
+                    "threshold_usd": window.get("alert_threshold_usd"),
+                    "samples": window.get("samples"),
+                    "account_count": window.get("account_count"),
+                }
+            )
+        elif was_below and not is_below:
+            events.append(
+                {
+                    "type": "pool_recovered",
+                    "window_key": window_key,
+                    "window_label": window.get("label") or window_key,
+                    "remaining_usd": window.get("remaining_usd"),
+                    "threshold_usd": window.get("alert_threshold_usd"),
+                    "samples": window.get("samples"),
+                    "account_count": window.get("account_count"),
+                }
+            )
+
     return {
         "events": events,
-        "state": {"version": 1, "updated_at": iso(current), "accounts": next_accounts},
+        "pool": pool,
+        "state": {
+            "version": 2,
+            "updated_at": iso(current),
+            "accounts": next_accounts,
+            "pool": next_pool,
+        },
     }
 
 
@@ -360,7 +511,31 @@ def format_alert_message(event, now=None):
     current = (now or utc_now()).astimezone(timezone(timedelta(hours=8)))
     account = event.get("account_label") or event.get("account_id") or "-"
     event_type = event.get("type")
-    if event_type == "quota_threshold":
+    if event_type == "pool_threshold":
+        title = "OpenCode Go 池额度预警"
+        samples = event.get("samples")
+        account_count = event.get("account_count")
+        coverage = (
+            f"{samples}/{account_count} 个账号计入"
+            if samples is not None and account_count is not None
+            else f"{samples or 0} 个账号计入"
+        )
+        lines = [
+            title,
+            f"窗口: {event.get('window_label')}",
+            f"池剩余: ${event.get('remaining_usd')} / ${event.get('total_usd')}",
+            f"已用: ${event.get('used_usd')}",
+            f"告警线: ${event.get('threshold_usd')}",
+            f"覆盖: {coverage}",
+        ]
+    elif event_type == "pool_recovered":
+        lines = [
+            "OpenCode Go 池额度已恢复",
+            f"窗口: {event.get('window_label')}",
+            f"池剩余: ${event.get('remaining_usd')}",
+            f"告警线: ${event.get('threshold_usd')}",
+        ]
+    elif event_type == "quota_threshold":
         title = "OpenCode Go 额度已用完" if event.get("remaining_percent", 0) <= 0 else "OpenCode Go 额度预警"
         lines = [
             title,
