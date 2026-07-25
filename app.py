@@ -3,13 +3,18 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
+import smtplib
 import sqlite3
 import struct
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from email.message import EmailMessage
 from functools import wraps
 from pathlib import Path
 from urllib.parse import quote, urljoin
@@ -19,24 +24,52 @@ from cryptography.fernet import Fernet
 from flask import Flask, jsonify, request, send_from_directory, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from opencode_go import (
+    OpenCodeError,
+    evaluate_alerts as evaluate_opencode_alerts,
+    fetch_dashboard_quota as fetch_opencode_quota,
+    fetch_models as fetch_opencode_models,
+    format_alert_message as format_opencode_alert_message,
+    mask_api_key as mask_opencode_api_key,
+    parse_alert_thresholds,
+    public_error as public_opencode_error,
+)
+
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.getenv("UPSTREAM_BALANCE_DATA_DIR", str(ROOT / "data"))).resolve()
 DB_PATH = DATA_DIR / "upstreams.sqlite3"
 KEY_PATH = DATA_DIR / "secret.key"
 SESSION_KEY_PATH = DATA_DIR / "session.secret"
 STATIC_DIR = ROOT / "static"
-REFRESH_INTERVAL_SECONDS = int(os.getenv("REFRESH_INTERVAL_SECONDS", "300"))
+REFRESH_INTERVAL_SECONDS = int(os.getenv("REFRESH_INTERVAL_SECONDS", "30"))
 NOTIFY_INTERVAL_SECONDS = int(os.getenv("NOTIFY_INTERVAL_SECONDS", "3600"))
 REQUEST_TIMEOUT = int(os.getenv("UPSTREAM_REQUEST_TIMEOUT", "25"))
 HISTORY_RETENTION_HOURS = int(os.getenv("HISTORY_RETENTION_HOURS", "72"))
 DEFAULT_CNY_RATE = Decimal(os.getenv("DEFAULT_CNY_RATE", "7.3"))
+RECHARGE_ROUNDING_UNIT = Decimal(os.getenv("RECHARGE_ROUNDING_UNIT", "100"))
 LOW_BALANCE_ALERT_CNY = Decimal(os.getenv("LOW_BALANCE_ALERT_CNY", "100"))
 LOW_BALANCE_ALERT_COOLDOWN_SECONDS = int(os.getenv("LOW_BALANCE_ALERT_COOLDOWN_SECONDS", "21600"))
+LOW_BALANCE_EMAIL_ENABLED = os.getenv("LOW_BALANCE_EMAIL_ENABLED", "0") == "1"
+LOW_BALANCE_EMAIL_FROM = os.getenv("LOW_BALANCE_EMAIL_FROM", "noreply@mail.sandboxai.top")
+LOW_BALANCE_EMAIL_SMTP_SERVER = os.getenv("LOW_BALANCE_EMAIL_SMTP_SERVER", "smtp.resend.com")
+LOW_BALANCE_EMAIL_SMTP_PORT = int(os.getenv("LOW_BALANCE_EMAIL_SMTP_PORT", "2587"))
+LOW_BALANCE_EMAIL_SMTP_USER = os.getenv("LOW_BALANCE_EMAIL_SMTP_USER", "resend")
+LOW_BALANCE_EMAIL_SMTP_TOKEN = os.getenv("LOW_BALANCE_EMAIL_SMTP_TOKEN", "")
+OPENCODE_GO_ORIGIN = os.getenv("OPENCODE_GO_ORIGIN", "https://opencode.ai").rstrip("/")
+OPENCODE_GO_ALERT_INTERVAL_SECONDS = max(30, int(os.getenv("OPENCODE_GO_ALERT_INTERVAL_SECONDS", "60")))
+OPENCODE_GO_ALERT_THRESHOLDS = parse_alert_thresholds(os.getenv("OPENCODE_GO_ALERT_THRESHOLDS", "20,5,0"))
+OPENCODE_GO_REFRESH_DEADLINE_SECONDS = max(
+    5, int(os.getenv("OPENCODE_GO_REFRESH_DEADLINE_SECONDS", "50"))
+)
+OPENCODE_GO_IMPORT_FILE = Path(
+    os.getenv("OPENCODE_GO_IMPORT_FILE", str(DATA_DIR / "opencode-import.json"))
+)
 
 
 def read_or_create_secret(path, size=32):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(DATA_DIR, 0o700)
     if not path.exists():
         path.write_bytes(secrets.token_bytes(size))
         os.chmod(path, 0o600)
@@ -46,11 +79,48 @@ def read_or_create_secret(path, size=32):
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="")
 app.config.update(
     SECRET_KEY=read_or_create_secret(SESSION_KEY_PATH),
+    SESSION_COOKIE_NAME=os.getenv("SESSION_COOKIE_NAME", "ub_admin_session"),
+    SESSION_COOKIE_PATH=os.getenv("SESSION_COOKIE_PATH", "/"),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "0") == "1",
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
 )
 refresh_lock = threading.Lock()
+opencode_cache = {}
+opencode_cache_lock = threading.Lock()
+opencode_refresh_lock = threading.Lock()
+opencode_alert_lock = threading.Lock()
+opencode_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="opencode-go")
+opencode_alert_status = {
+    "enabled": False,
+    "running": False,
+    "interval_seconds": OPENCODE_GO_ALERT_INTERVAL_SECONDS,
+    "thresholds": OPENCODE_GO_ALERT_THRESHOLDS,
+    "last_run_at": None,
+    "last_success_at": None,
+    "last_error": None,
+    "delivered_events": 0,
+}
+
+
+class UbMethodOverrideMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        override = environ.get("HTTP_X_UB_METHOD", "")
+        if path.startswith("/_ub_api/") and override:
+            environ["REQUEST_METHOD"] = override.upper()
+        return self.app(environ, start_response)
+
+
+app.wsgi_app = UbMethodOverrideMiddleware(app.wsgi_app)
+
+
+class OpenCodeRefreshBusy(RuntimeError):
+    pass
 
 
 def now_iso():
@@ -59,6 +129,7 @@ def now_iso():
 
 def ensure_data_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(DATA_DIR, 0o700)
 
 
 def get_cipher():
@@ -83,14 +154,17 @@ def decrypt(value):
 
 def db():
     ensure_data_dir()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    os.chmod(DB_PATH, 0o600)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 10000")
     return conn
 
 
 def init_db():
     with db() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS channels (
@@ -118,6 +192,8 @@ def init_db():
         )
         ensure_column(conn, "channels", "credential_enc", "TEXT")
         ensure_column(conn, "channels", "cny_rate", "REAL")
+        ensure_column(conn, "channels", "alert_cny", "REAL")
+        ensure_column(conn, "channels", "boss_recharge_required", "INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             """
             UPDATE channels
@@ -125,6 +201,14 @@ def init_db():
             WHERE cny_rate IS NULL
             """,
             (as_float(DEFAULT_CNY_RATE),),
+        )
+        conn.execute(
+            """
+            UPDATE channels
+            SET alert_cny = ?
+            WHERE alert_cny IS NULL
+            """,
+            (as_float(LOW_BALANCE_ALERT_CNY),),
         )
         conn.execute(
             """
@@ -203,13 +287,32 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS opencode_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_key TEXT NOT NULL UNIQUE,
+                label TEXT NOT NULL,
+                workspace_id TEXT NOT NULL DEFAULT '',
+                auth_cookie_enc TEXT NOT NULL DEFAULT '',
+                api_key_enc TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
 
 
 def ensure_column(conn, table, column, column_type):
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     if column in {row["name"] for row in rows}:
         return
-    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
 
 
 def setting_get(key, default=""):
@@ -237,16 +340,368 @@ def setting_delete(key):
 
 def public_settings():
     webhook_enc = setting_get("wecom_webhook_enc")
+    feishu_webhook_enc = setting_get("feishu_webhook_enc")
+    email_recipients = setting_get("low_balance_email_recipients", os.getenv("LOW_BALANCE_EMAIL_RECIPIENTS", ""))
     return {
         "wecom_configured": bool(webhook_enc),
+        "feishu_configured": bool(feishu_webhook_enc),
+        "email_configured": low_balance_email_configured(email_recipients),
+        "low_balance_email_recipients": email_recipients,
         "notify_enabled": setting_get("notify_enabled", "1") == "1",
         "refresh_interval_seconds": REFRESH_INTERVAL_SECONDS,
         "notify_interval_seconds": NOTIFY_INTERVAL_SECONDS,
         "history_retention_hours": HISTORY_RETENTION_HOURS,
         "default_cny_rate": as_float(DEFAULT_CNY_RATE),
+        "recharge_rounding_unit": as_float(RECHARGE_ROUNDING_UNIT),
         "low_balance_alert_cny": as_float(LOW_BALANCE_ALERT_CNY),
         "low_balance_alert_cooldown_seconds": LOW_BALANCE_ALERT_COOLDOWN_SECONDS,
     }
+
+
+def validate_opencode_workspace_id(value):
+    workspace_id = str(value or "").strip()
+    if workspace_id and not re.fullmatch(r"wrk_[A-Za-z0-9]+", workspace_id):
+        raise ValueError("Workspace ID 格式应为 wrk_ 开头的字母数字串")
+    return workspace_id
+
+
+def normalize_opencode_account_key(value, fallback="account"):
+    account_key = re.sub(r"[^a-z0-9_-]+", "-", str(value or "").strip().lower()).strip("-_")
+    account_key = (account_key or fallback)[:40]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,39}", account_key):
+        raise ValueError("账号 ID 需要使用小写字母、数字、下划线或连字符")
+    return account_key
+
+
+def unique_opencode_account_key(conn, preferred):
+    candidate = preferred
+    suffix = 2
+    while conn.execute("SELECT 1 FROM opencode_accounts WHERE account_key = ?", (candidate,)).fetchone():
+        ending = f"-{suffix}"
+        candidate = f"{preferred[:40 - len(ending)]}{ending}"
+        suffix += 1
+    return candidate
+
+
+def list_opencode_account_rows(enabled_only=False):
+    where = "WHERE enabled = 1" if enabled_only else ""
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM opencode_accounts {where} ORDER BY id ASC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_opencode_account(account_id):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM opencode_accounts WHERE id = ?", (account_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def public_opencode_account(row):
+    api_key = decrypt(row.get("api_key_enc", "")) if row.get("api_key_enc") else ""
+    workspace_id = row.get("workspace_id") or ""
+    has_auth_cookie = bool(row.get("auth_cookie_enc"))
+    has_api_key = bool(api_key)
+    return {
+        "id": row["id"],
+        "account_key": row["account_key"],
+        "label": row["label"],
+        "workspace_id": workspace_id or None,
+        "quota_configured": bool(workspace_id and has_auth_cookie),
+        "models_configured": has_api_key,
+        "has_auth_cookie": has_auth_cookie,
+        "has_api_key": has_api_key,
+        "api_key_hint": mask_opencode_api_key(api_key),
+        "enabled": bool(row.get("enabled", 1)),
+        "quota": None,
+        "quota_error": None,
+        "models": None,
+        "models_error": None,
+    }
+
+
+def clear_opencode_cache(account_id=None):
+    with opencode_cache_lock:
+        if account_id is None:
+            opencode_cache.clear()
+            return
+        suffix = f":{account_id}"
+        for key in [item for item in opencode_cache if item.endswith(suffix)]:
+            opencode_cache.pop(key, None)
+
+
+def opencode_secret_fingerprint(*values):
+    raw = "\0".join(str(value or "") for value in values)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def opencode_cached_value(bucket, fingerprint, ttl_seconds, stale_seconds, force, loader):
+    with opencode_cache_lock:
+        cached = deepcopy(opencode_cache.get(bucket))
+    age = time.time() - cached["stored_at"] if cached else float("inf")
+    if not force and cached and cached["fingerprint"] == fingerprint and age < ttl_seconds:
+        value = deepcopy(cached["value"])
+        value["cache"] = {"status": "fresh", "age_seconds": int(age)}
+        return value
+    try:
+        value = loader()
+        with opencode_cache_lock:
+            opencode_cache[bucket] = {
+                "fingerprint": fingerprint,
+                "stored_at": time.time(),
+                "value": deepcopy(value),
+            }
+        result = deepcopy(value)
+        result["cache"] = {"status": "live", "age_seconds": 0}
+        return result
+    except Exception as exc:
+        if cached and cached["fingerprint"] == fingerprint and age < stale_seconds:
+            value = deepcopy(cached["value"])
+            value["cache"] = {
+                "status": "stale",
+                "age_seconds": int(age),
+                "warning": str(exc),
+            }
+            return value
+        raise
+
+
+def fetch_opencode_account_part(row, kind, force=False):
+    account_id = row["id"]
+    if kind == "quota":
+        workspace_id = row.get("workspace_id") or ""
+        auth_cookie = decrypt(row.get("auth_cookie_enc", ""))
+        fingerprint = opencode_secret_fingerprint(workspace_id, auth_cookie)
+        return opencode_cached_value(
+            f"quota:{account_id}",
+            fingerprint,
+            ttl_seconds=45,
+            stale_seconds=600,
+            force=force,
+            loader=lambda: fetch_opencode_quota(
+                workspace_id,
+                auth_cookie,
+                origin=OPENCODE_GO_ORIGIN,
+                timeout=REQUEST_TIMEOUT,
+            ),
+        )
+    api_key = decrypt(row.get("api_key_enc", ""))
+    fingerprint = opencode_secret_fingerprint(api_key)
+    return opencode_cached_value(
+        f"models:{account_id}",
+        fingerprint,
+        ttl_seconds=600,
+        stale_seconds=3600,
+        force=force,
+        loader=lambda: fetch_opencode_models(
+            api_key,
+            origin=OPENCODE_GO_ORIGIN,
+            timeout=REQUEST_TIMEOUT,
+        ),
+    )
+
+
+def load_opencode_accounts(force=False, deadline_seconds=None, reject_if_busy=False):
+    acquired = opencode_refresh_lock.acquire(blocking=not reject_if_busy)
+    if not acquired:
+        raise OpenCodeRefreshBusy("OpenCode Go 正在刷新，请稍后重试")
+    try:
+        return _load_opencode_accounts(force=force, deadline_seconds=deadline_seconds)
+    finally:
+        opencode_refresh_lock.release()
+
+
+def _load_opencode_accounts(force=False, deadline_seconds=None):
+    rows = list_opencode_account_rows(enabled_only=True)
+    states = [public_opencode_account(row) for row in rows]
+    futures = {}
+    for index, row in enumerate(rows):
+        if states[index]["quota_configured"]:
+            future = opencode_executor.submit(fetch_opencode_account_part, row, "quota", force)
+            futures[future] = (index, "quota")
+        if states[index]["models_configured"]:
+            future = opencode_executor.submit(fetch_opencode_account_part, row, "models", force)
+            futures[future] = (index, "models")
+    deadline = OPENCODE_GO_REFRESH_DEADLINE_SECONDS if deadline_seconds is None else max(0, deadline_seconds)
+    completed, pending = wait(futures, timeout=deadline)
+    for future in completed:
+        index, kind = futures[future]
+        try:
+            states[index][kind] = future.result()
+        except Exception as exc:
+            states[index][f"{kind}_error"] = public_opencode_error(exc)
+    for future in pending:
+        index, kind = futures[future]
+        future.cancel()
+        states[index][f"{kind}_error"] = f"刷新超过整体时限（{deadline:g} 秒），已返回其他可用结果"
+    return states
+
+
+def save_opencode_account(payload, account_id=None):
+    current = get_opencode_account(account_id) if account_id is not None else None
+    if account_id is not None and not current:
+        raise LookupError("OpenCode Go 账号不存在")
+
+    label = str(payload.get("label") or (current or {}).get("label") or "").strip()
+    if not label:
+        raise ValueError("账号名称不能为空")
+    if payload.get("clear_workspace_id"):
+        workspace_id = ""
+    else:
+        workspace_id = validate_opencode_workspace_id(
+            payload.get("workspace_id", (current or {}).get("workspace_id", ""))
+        )
+
+    current_auth_cookie = decrypt(current.get("auth_cookie_enc", "")) if current else ""
+    current_api_key = decrypt(current.get("api_key_enc", "")) if current else ""
+    incoming_auth_cookie = str(payload.get("auth_cookie") or "").strip()
+    incoming_api_key = str(payload.get("api_key") or "").strip()
+    auth_cookie = "" if payload.get("clear_auth_cookie") else incoming_auth_cookie or current_auth_cookie
+    api_key = "" if payload.get("clear_api_key") else incoming_api_key or current_api_key
+    if not workspace_id and not auth_cookie and not api_key:
+        raise ValueError("请至少配置 Workspace、auth Cookie 或 API key")
+    enabled = 1 if payload.get("enabled", (current or {}).get("enabled", 1)) else 0
+    ts = now_iso()
+    with db() as conn:
+        if current:
+            conn.execute(
+                """
+                UPDATE opencode_accounts
+                SET label = ?, workspace_id = ?, auth_cookie_enc = ?, api_key_enc = ?, enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (label, workspace_id, encrypt(auth_cookie), encrypt(api_key), enabled, ts, account_id),
+            )
+            saved_id = account_id
+        else:
+            preferred = normalize_opencode_account_key(payload.get("account_key") or label, "account")
+            account_key = unique_opencode_account_key(conn, preferred)
+            cur = conn.execute(
+                """
+                INSERT INTO opencode_accounts(
+                    account_key, label, workspace_id, auth_cookie_enc, api_key_enc,
+                    enabled, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (account_key, label, workspace_id, encrypt(auth_cookie), encrypt(api_key), enabled, ts, ts),
+            )
+            saved_id = cur.lastrowid
+    clear_opencode_cache(saved_id)
+    return public_opencode_account(get_opencode_account(saved_id))
+
+
+def import_opencode_accounts(path=OPENCODE_GO_IMPORT_FILE):
+    import_path = Path(path)
+    if not import_path.exists():
+        return 0
+    try:
+        payload = json.loads(import_path.read_text(encoding="utf-8"))
+        accounts = payload.get("accounts") if isinstance(payload, dict) else None
+        if not isinstance(accounts, list):
+            raise ValueError("OpenCode 导入文件缺少 accounts 数组")
+        prepared = []
+        for index, account in enumerate(accounts):
+            if not isinstance(account, dict):
+                continue
+            workspace_id = validate_opencode_workspace_id(account.get("workspaceId"))
+            auth_cookie = str(account.get("authCookie") or "").strip()
+            api_key = str(account.get("apiKey") or "").strip()
+            if not workspace_id and not auth_cookie and not api_key:
+                continue
+            label = str(account.get("label") or f"账号 {index + 1}").strip() or f"账号 {index + 1}"
+            account_key = normalize_opencode_account_key(account.get("id"), f"account-{index + 1}")
+            prepared.append((account_key, label, workspace_id, auth_cookie, api_key))
+
+        with db() as conn:
+            existing = conn.execute("SELECT COUNT(*) FROM opencode_accounts").fetchone()[0]
+            if existing:
+                imported = 0
+            else:
+                imported = 0
+                ts = now_iso()
+                for account_key, label, workspace_id, auth_cookie, api_key in prepared:
+                    account_key = unique_opencode_account_key(conn, account_key)
+                    conn.execute(
+                        """
+                        INSERT INTO opencode_accounts(
+                            account_key, label, workspace_id, auth_cookie_enc, api_key_enc,
+                            enabled, created_at, updated_at
+                        ) VALUES(?, ?, ?, ?, ?, 1, ?, ?)
+                        """,
+                        (
+                            account_key,
+                            label,
+                            workspace_id,
+                            encrypt(auth_cookie),
+                            encrypt(api_key),
+                            ts,
+                            ts,
+                        ),
+                    )
+                    imported += 1
+        import_path.unlink(missing_ok=True)
+        print(f"[opencode-go] imported_accounts={imported} plaintext_import_removed=1", flush=True)
+        return imported
+    except Exception as exc:
+        print(f"[opencode-go] import failed: {exc}", flush=True)
+        return 0
+
+
+def opencode_notifications_enabled():
+    return notification_webhooks_configured() or low_balance_email_configured()
+
+
+def public_opencode_alert_status():
+    with opencode_alert_lock:
+        status = dict(opencode_alert_status)
+    status["enabled"] = opencode_notifications_enabled()
+    return status
+
+
+def deliver_opencode_event(event):
+    content = format_opencode_alert_message(event)
+    webhook_sent = post_notification_text(content) if notification_webhooks_configured() else []
+    email_sent = post_low_balance_email(content.splitlines()[0], content) if low_balance_email_configured() else False
+    return bool(webhook_sent or email_sent)
+
+
+def run_opencode_alert_monitor(force=False):
+    if not opencode_alert_lock.acquire(blocking=False):
+        return public_opencode_alert_status()
+    try:
+        opencode_alert_status["running"] = True
+        opencode_alert_status["enabled"] = opencode_notifications_enabled()
+        opencode_alert_status["last_run_at"] = now_iso()
+        if not opencode_alert_status["enabled"] and not force:
+            return dict(opencode_alert_status)
+        accounts = load_opencode_accounts(force=False)
+        try:
+            previous = json.loads(setting_get("opencode_alert_state", "{}") or "{}")
+        except json.JSONDecodeError:
+            previous = {}
+        evaluation = evaluate_opencode_alerts(
+            accounts,
+            previous_state=previous,
+            thresholds=OPENCODE_GO_ALERT_THRESHOLDS,
+        )
+        delivered = 0
+        for event in evaluation["events"]:
+            if not deliver_opencode_event(event):
+                raise RuntimeError("OpenCode Go 告警通道发送失败")
+            delivered += 1
+        setting_set("opencode_alert_state", json.dumps(evaluation["state"], ensure_ascii=False))
+        opencode_alert_status["last_success_at"] = now_iso()
+        opencode_alert_status["last_error"] = None
+        opencode_alert_status["delivered_events"] += delivered
+    except Exception as exc:
+        opencode_alert_status["last_error"] = str(exc)
+        print(f"[opencode-go] alert monitor failed: {exc}", flush=True)
+    finally:
+        opencode_alert_status["running"] = False
+        status = dict(opencode_alert_status)
+        opencode_alert_lock.release()
+    return status
 
 
 def normalize_url(base_url):
@@ -284,7 +739,32 @@ def cny_value(usd_value, cny_rate):
     usd = decimal_from(usd_value)
     if usd is None:
         return None
-    return as_float(usd * rate_from(cny_rate))
+    return as_float(usd / rate_from(cny_rate))
+
+
+def alert_threshold_from(value, default=None):
+    threshold = decimal_from(value)
+    if threshold is not None and threshold > 0:
+        return threshold
+    fallback = decimal_from(default)
+    if fallback is not None and fallback > 0:
+        return fallback
+    return LOW_BALANCE_ALERT_CNY
+
+
+def join_url_path(base_url, path):
+    base = normalize_url(base_url)
+    return urljoin(base, path.lstrip("/"))
+
+
+def recharge_url_for(platform, base_url):
+    path = "/purchase" if platform == "sub2api" else "/console/topup"
+    return join_url_path(base_url, path)
+
+
+def recharge_admin_url_for(platform, base_url):
+    path = "/admin/orders" if platform == "sub2api" else "/console/log"
+    return join_url_path(base_url, path)
 
 
 def history_cutoff_iso():
@@ -293,6 +773,28 @@ def history_cutoff_iso():
 
 def response_error(message, status=400):
     return jsonify({"ok": False, "message": message}), status
+
+
+def log_channel_create(platform, base_url, username, message):
+    safe_platform = str(platform or "-")
+    safe_base_url = str(base_url or "-")
+    safe_username = str(username or "-")
+    print(
+        f"[channel-create] platform={safe_platform} base_url={safe_base_url} "
+        f"username={safe_username} result={message}",
+        flush=True,
+    )
+
+
+def request_payload(force=False):
+    encoded = request.headers.get("X-UB-Payload")
+    if encoded:
+        try:
+            raw = base64.urlsafe_b64decode(encoded.encode("ascii"))
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, json.JSONDecodeError):
+            return {}
+    return request.get_json(force=force, silent=True) or {}
 
 
 def user_count():
@@ -310,19 +812,37 @@ def get_user(user_id):
         return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
+def setup_login(user):
+    session.permanent = True
+    session["id"] = user["id"]
+    session["username"] = user["username"]
+    session["totp_enabled"] = bool(user["totp_enabled"])
+
+
+def clear_login():
+    session.clear()
+
+
 def current_user():
-    user_id = session.get("user_id")
-    return get_user(user_id) if user_id else None
+    user_id = session.get("id")
+    if not user_id:
+        return None
+    user = get_user(user_id)
+    if not user:
+        clear_login()
+        return None
+    return user
 
 
-def auth_state():
-    user = current_user()
-    return {
+def auth_state(user=None):
+    active_user = user if user is not None else current_user()
+    state = {
         "needs_setup": user_count() == 0,
-        "authenticated": bool(user),
-        "username": user["username"] if user else "",
-        "totp_enabled": bool(user["totp_enabled"]) if user else False,
+        "authenticated": bool(active_user),
+        "username": active_user["username"] if active_user else "",
+        "totp_enabled": bool(active_user["totp_enabled"]) if active_user else False,
     }
+    return state
 
 
 def login_required(fn):
@@ -468,6 +988,10 @@ def record_recharge_log(conn, channel_id, log, cny_rate):
     if amount_usd is None or amount_usd <= 0:
         return False
     rate = rate_from(cny_rate)
+    before_balance = decimal_from(log.get("before_balance"))
+    after_balance = decimal_from(log.get("after_balance"))
+    if after_balance is None:
+        after_balance = amount_usd
     detected_at = log.get("detected_at") or now_iso()
     source_ref = log.get("source_ref") or source_hash(channel_id, amount_usd, detected_at, log.get("source_status"))
     conn.execute(
@@ -476,7 +1000,7 @@ def record_recharge_log(conn, channel_id, log, cny_rate):
             channel_id, before_balance, after_balance, amount_usd, amount_cny, cny_rate,
             detected_at, source_ref, source_status, source_type, created_at
         )
-        VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(channel_id, source_ref) DO UPDATE SET
             amount_usd = excluded.amount_usd,
             amount_cny = excluded.amount_cny,
@@ -487,9 +1011,10 @@ def record_recharge_log(conn, channel_id, log, cny_rate):
         """,
         (
             channel_id,
+            as_float(before_balance),
+            as_float(after_balance),
             as_float(amount_usd),
-            as_float(amount_usd),
-            as_float(amount_usd * rate),
+            as_float(amount_usd / rate),
             as_float(rate),
             detected_at,
             source_ref,
@@ -499,6 +1024,55 @@ def record_recharge_log(conn, channel_id, log, cny_rate):
         ),
     )
     return True
+
+
+def inferred_recharge_amount(before_balance, after_balance):
+    before = decimal_from(before_balance)
+    after = decimal_from(after_balance)
+    if before is None or after is None or after <= before:
+        return None
+    delta = after - before
+    if RECHARGE_ROUNDING_UNIT <= 0:
+        return delta
+    rounded = (delta / RECHARGE_ROUNDING_UNIT).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * RECHARGE_ROUNDING_UNIT
+    if rounded <= 0:
+        return None
+    return rounded
+
+
+def has_matching_recharge_log(logs, amount, tolerance=Decimal("0.01")):
+    target = decimal_from(amount)
+    if target is None:
+        return False
+    for log in logs or []:
+        logged_amount = decimal_from(log.get("amount_usd"))
+        if logged_amount is not None and abs(logged_amount - target) <= tolerance:
+            return True
+    return False
+
+
+def balance_delta_recharge_log(channel_id, previous_row, result, checked_at):
+    before_balance = channel_value(previous_row, "balance") if previous_row else None
+    after_balance = result.get("balance")
+    amount = inferred_recharge_amount(before_balance, after_balance)
+    if amount is None or has_matching_recharge_log(result.get("recharge_logs") or [], amount):
+        return None
+    return {
+        "before_balance": before_balance,
+        "after_balance": after_balance,
+        "amount_usd": amount,
+        "detected_at": checked_at,
+        "source_ref": source_hash(
+            "balance_delta",
+            channel_id,
+            before_balance,
+            after_balance,
+            checked_at,
+            amount,
+        ),
+        "source_status": "inferred",
+        "source_type": f"balance_delta_nearest_{format_money(as_float(RECHARGE_ROUNDING_UNIT))}",
+    }
 
 
 def sync_recharge_logs(conn, channel, logs):
@@ -511,6 +1085,17 @@ def sync_recharge_logs(conn, channel, logs):
     return count
 
 
+def safe_sync_recharge_logs(conn, channel, logs):
+    try:
+        return sync_recharge_logs(conn, channel, logs)
+    except Exception as exc:
+        print(
+            f"[recharge-sync] channel_id={channel['id']} failed: {exc}",
+            flush=True,
+        )
+        return 0
+
+
 def prune_history(conn):
     conn.execute("DELETE FROM balance_history WHERE checked_at < ?", (history_cutoff_iso(),))
 
@@ -520,9 +1105,13 @@ def row_to_channel(row, include_secret=False):
     item.pop("password_enc", None)
     item.pop("credential_enc", None)
     item["enabled"] = bool(item["enabled"])
+    item["boss_recharge_required"] = bool(item.get("boss_recharge_required"))
     item["cny_rate"] = as_float(rate_from(item.get("cny_rate")))
+    item["alert_cny"] = as_float(alert_threshold_from(item.get("alert_cny")))
     item["cny_balance"] = cny_value(item.get("balance"), item["cny_rate"])
     item["cny_used_balance"] = cny_value(item.get("used_balance"), item["cny_rate"])
+    item["recharge_url"] = recharge_url_for(item["platform"], item["base_url"])
+    item["recharge_admin_url"] = recharge_admin_url_for(item["platform"], item["base_url"])
     item["history"] = list_balance_history(item["id"])
     item["recharge_logs"] = list_recharge_logs(item["id"], 12)
     if item.get("raw_response"):
@@ -577,10 +1166,59 @@ def save_channel_credential(channel_id, credential):
         )
 
 
+SUB2API_PROFILE_KEYS = ("user", "profile", "account", "current_user")
+SUB2API_BALANCE_KEYS = (
+    "balance",
+    "quota",
+    "credit",
+    "credits",
+    "remaining_balance",
+    "available_balance",
+    "account_balance",
+    "wallet_balance",
+)
+SUB2API_USED_KEYS = ("used_balance", "used_quota", "quota_used", "used", "total_used")
+
+
 def extract_sub2api_payload(data):
-    if isinstance(data, dict) and isinstance(data.get("data"), dict):
-        return data["data"]
-    return data if isinstance(data, dict) else {}
+    if isinstance(data, dict) and "data" in data:
+        payload = data.get("data")
+        if isinstance(payload, (dict, list)):
+            return payload
+    return data if isinstance(data, (dict, list)) else {}
+
+
+def first_decimal(payload, keys):
+    if not isinstance(payload, dict):
+        return None, None, None
+    for key in keys:
+        if key not in payload:
+            continue
+        value = decimal_from(payload.get(key))
+        if value is not None:
+            return key, value, payload.get(key)
+    return None, None, None
+
+
+def find_sub2api_user_payload(payload):
+    if isinstance(payload, list):
+        for item in payload:
+            found = find_sub2api_user_payload(item)
+            if found:
+                return found
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    if first_decimal(payload, SUB2API_BALANCE_KEYS)[1] is not None:
+        return payload
+    for key in SUB2API_PROFILE_KEYS:
+        nested = payload.get(key)
+        if isinstance(nested, (dict, list)):
+            found = find_sub2api_user_payload(nested)
+            if found:
+                return found
+    return payload
 
 
 def paginated_items(payload):
@@ -588,7 +1226,7 @@ def paginated_items(payload):
         return payload
     if not isinstance(payload, dict):
         return []
-    for key in ("items", "records", "list", "data"):
+    for key in ("items", "records", "list", "rows", "data"):
         value = payload.get(key)
         if isinstance(value, list):
             return value
@@ -624,8 +1262,124 @@ def successful_new_api_topup(status):
     return str(status or "").lower() == "success"
 
 
+def successful_new_api_topup_value(item):
+    status = str(item.get("status") or "").lower()
+    if status in {"success", "succeeded", "paid", "completed", "1", "true"}:
+        return True
+    if item.get("status") in (1, True):
+        return True
+    return False
+
+
 def successful_sub2api_order(status):
-    return str(status or "").upper() == "COMPLETED"
+    return str(status or "").upper() in {"COMPLETED", "PAID", "SUCCESS", "SUCCEEDED"}
+
+
+def first_amount(payload, keys):
+    for key in keys:
+        amount = decimal_from(payload.get(key))
+        if amount is not None:
+            return key, amount
+    return None, None
+
+
+NEW_API_LOG_TYPE_TOPUP = 1
+NEW_API_LOG_TYPE_MANAGE = 3
+NUMBER_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
+
+
+def new_api_headers(credential):
+    headers = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+    token = credential.get("access_token")
+    user_id = credential.get("user_id")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if user_id:
+        headers["New-Api-User"] = str(user_id)
+    return headers
+
+
+def new_api_topup_amount(base_url, item):
+    quota_key, quota = first_amount(item, ("quota", "amount_quota", "quota_amount"))
+    if quota is not None:
+        return quota_key, quota / get_new_api_quota_unit(base_url)
+    key, amount = first_amount(
+        item,
+        ("money", "pay_money", "pay_amount", "actual_amount", "total_amount", "amount"),
+    )
+    if amount is not None:
+        return key, amount
+    return None, None
+
+
+def logged_quota_values(text, quota_unit):
+    quota_unit = quota_unit or Decimal("500000")
+    values = []
+    for match in NUMBER_RE.finditer(str(text or "")):
+        amount = decimal_from(match.group(0).replace(",", ""))
+        if amount is None:
+            continue
+        before = text[max(0, match.start() - 3):match.start()]
+        after = text[match.end():match.end() + 6]
+        if "$" in before or "＄" in before:
+            normalized = amount
+        elif "¥" in before or "￥" in before:
+            normalized = amount / DEFAULT_CNY_RATE
+        elif "点额度" in after or (quota_unit and amount >= quota_unit):
+            normalized = amount / quota_unit
+        else:
+            normalized = amount
+        values.append(normalized)
+    return values
+
+
+def new_api_balance_log_item(base_url, item, quota_unit):
+    content = str(item.get("content") or "")
+    amount = None
+    source_type = ""
+    values = logged_quota_values(content, quota_unit)
+
+    if "通过兑换码充值" in content:
+        amount = values[0] if values else None
+        source_type = "redemption"
+    elif "管理员增加用户额度" in content:
+        amount = values[0] if values else None
+        source_type = "admin_add_quota"
+    elif "管理员覆盖用户额度从" in content and len(values) >= 2:
+        amount = values[1] - values[0]
+        source_type = "admin_set_quota"
+
+    if amount is None or amount <= 0:
+        return None
+
+    detected_at = stable_time(
+        item.get("created_at") or item.get("created_time") or item.get("timestamp") or item.get("time")
+    ) or now_iso()
+    return {
+        "amount_usd": amount,
+        "detected_at": detected_at,
+        "source_ref": source_hash(
+            "new_api_log",
+            item.get("created_at"),
+            item.get("type"),
+            content,
+            amount,
+        ),
+        "source_status": "success",
+        "source_type": source_type,
+    }
+
+
+def unique_recharge_logs(logs):
+    result = []
+    seen = set()
+    for log in logs:
+        key = log.get("source_ref") or source_hash(log.get("amount_usd"), log.get("detected_at"), log.get("source_type"))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(log)
+    return result
 
 
 def sub2api_login(base_url, username, password):
@@ -683,15 +1437,36 @@ def sub2api_refresh(base_url, refresh_token):
 
 def sub2api_profile(base_url, access_token):
     session = requests.Session()
-    profile = session.get(
-        urljoin(base_url, "/api/v1/user/profile"),
-        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
-        timeout=REQUEST_TIMEOUT,
-    )
-    profile_data = safe_json(profile)
-    if profile.status_code >= 400:
-        raise RuntimeError(read_message(profile_data) or f"profile 读取失败 HTTP {profile.status_code}")
-    return extract_sub2api_payload(profile_data)
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+    last_error = ""
+    first_payload = None
+    for path in ("/api/v1/user/profile", "/api/v1/auth/me"):
+        resp = session.get(urljoin(base_url, path), headers=headers, timeout=REQUEST_TIMEOUT)
+        data = safe_json(resp)
+        if resp.status_code < 400 and truthy_success(data):
+            payload = extract_sub2api_payload(data)
+            if first_payload is None:
+                first_payload = payload
+            if first_decimal(find_sub2api_user_payload(payload), SUB2API_BALANCE_KEYS)[1] is not None:
+                return payload
+            last_error = f"{path} 响应里没有可识别余额字段"
+            continue
+        last_error = read_message(data) or f"{path} 读取失败 HTTP {resp.status_code}"
+    if first_payload is not None:
+        return first_payload
+    raise RuntimeError(last_error or "profile 读取失败")
+
+
+def safe_sub2api_recharge_logs(base_url, access_token):
+    try:
+        return sub2api_recharge_logs(base_url, access_token)
+    except (requests.RequestException, RuntimeError):
+        return []
+
+
+def sub2api_token_error(exc):
+    message = str(exc).lower()
+    return any(marker in message for marker in ("401", "unauthorized", "unauthenticated", "token", "expired"))
 
 
 def sub2api_recharge_logs(base_url, access_token):
@@ -708,23 +1483,26 @@ def sub2api_recharge_logs(base_url, access_token):
     for item in paginated_items(extract_sub2api_payload(data)):
         if not isinstance(item, dict) or not successful_sub2api_order(item.get("status")):
             continue
-        amount = decimal_from(item.get("amount"))
+        _, amount = first_amount(item, ("amount", "pay_amount", "actual_amount", "total_amount"))
         if amount is None or amount <= 0:
             continue
-        detected_at = stable_time(item.get("completed_at") or item.get("paid_at") or item.get("created_at")) or now_iso()
+        detected_at = stable_time(
+            item.get("completed_at") or item.get("paid_at") or item.get("updated_at") or item.get("created_at")
+        ) or now_iso()
         logs.append({
             "amount_usd": amount,
             "detected_at": detected_at,
             "source_ref": source_hash(
                 "sub2api",
                 item.get("id"),
+                item.get("out_trade_no"),
                 item.get("created_at"),
                 item.get("completed_at"),
                 item.get("status"),
                 amount,
             ),
             "source_status": item.get("status", ""),
-            "source_type": item.get("payment_type", ""),
+            "source_type": item.get("payment_type") or item.get("provider_key") or item.get("payment_method") or "",
         })
     return logs
 
@@ -732,16 +1510,21 @@ def sub2api_recharge_logs(base_url, access_token):
 def build_sub2api_result(profile_payload, fallback_user=None):
     if not profile_payload and fallback_user:
         profile_payload = fallback_user
+    profile_payload = find_sub2api_user_payload(profile_payload)
+    if (not profile_payload or first_decimal(profile_payload, SUB2API_BALANCE_KEYS)[1] is None) and fallback_user:
+        profile_payload = find_sub2api_user_payload(fallback_user)
 
-    balance = decimal_from(profile_payload.get("balance"))
+    balance_key, balance, raw_balance = first_decimal(profile_payload, SUB2API_BALANCE_KEYS)
     if balance is None:
-        raise RuntimeError("profile 响应里没有 balance")
+        raise RuntimeError("profile 响应里没有可识别余额字段")
+
+    used_key, used_balance, raw_used_balance = first_decimal(profile_payload, SUB2API_USED_KEYS)
 
     return {
         "balance": balance,
-        "raw_balance": str(profile_payload.get("balance")),
-        "used_balance": None,
-        "raw_used_balance": None,
+        "raw_balance": str(raw_balance),
+        "used_balance": used_balance,
+        "raw_used_balance": str(raw_used_balance) if used_key else None,
         "request_count": None,
         "currency": "USD",
         "status": "ok",
@@ -751,6 +1534,8 @@ def build_sub2api_result(profile_payload, fallback_user=None):
             "role": profile_payload.get("role"),
             "concurrency": profile_payload.get("concurrency"),
             "status": profile_payload.get("status"),
+            "balance_field": balance_key,
+            "used_balance_field": used_key,
         },
     }
 
@@ -763,17 +1548,16 @@ def fetch_sub2api(channel):
     if credential.get("access_token"):
         try:
             result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]))
-            result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
+            result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
             return result
         except RuntimeError as exc:
-            message = str(exc).lower()
-            if "401" not in message and "unauthorized" not in message:
+            if not sub2api_token_error(exc):
                 raise
             credential = sub2api_refresh(base_url, credential.get("refresh_token"))
             if channel_id:
                 save_channel_credential(channel_id, credential)
             result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]))
-            result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
+            result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
             return result
 
     password_enc = channel_value(channel, "password_enc", "")
@@ -781,13 +1565,13 @@ def fetch_sub2api(channel):
         raise RuntimeError("缺少可用令牌，请重新添加渠道")
     credential, user = sub2api_login(base_url, channel["username"], decrypt(password_enc))
     result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]), user)
-    result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
+    result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
     if channel_id:
         save_channel_credential(channel_id, credential)
     return result
 
 
-def new_api_login(base_url, username, password):
+def new_api_login(base_url, username, password, totp_code=""):
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
     login = session.post(
@@ -800,6 +1584,19 @@ def new_api_login(base_url, username, password):
         raise RuntimeError(read_message(login_data) or f"登录失败 HTTP {login.status_code}")
 
     user = login_data.get("data") if isinstance(login_data.get("data"), dict) else {}
+    if user.get("require_2fa"):
+        code = "".join(ch for ch in str(totp_code or "") if ch.isdigit())
+        if not code:
+            raise RuntimeError("上游 New API 已开启 2FA，请填写验证码")
+        twofa = session.post(
+            urljoin(base_url, "/api/user/login/2fa"),
+            json={"code": code},
+            timeout=REQUEST_TIMEOUT,
+        )
+        twofa_data = safe_json(twofa)
+        if twofa.status_code >= 400 or not truthy_success(twofa_data):
+            raise RuntimeError(read_message(twofa_data) or f"2FA 登录失败 HTTP {twofa.status_code}")
+        user = twofa_data.get("data") if isinstance(twofa_data.get("data"), dict) else {}
     return session, user
 
 
@@ -826,13 +1623,8 @@ def new_api_generate_token(base_url, session, user_id):
 
 
 def new_api_self(base_url, credential, session=None):
-    token = credential.get("access_token")
+    headers = new_api_headers(credential)
     user_id = credential.get("user_id")
-    headers = {"X-Requested-With": "XMLHttpRequest"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    if user_id:
-        headers["New-Api-User"] = str(user_id)
 
     client = session or requests.Session()
     self_resp = client.get(urljoin(base_url, "/api/user/self"), headers=headers, timeout=REQUEST_TIMEOUT)
@@ -846,14 +1638,8 @@ def new_api_self(base_url, credential, session=None):
     return self_data.get("data") if isinstance(self_data.get("data"), dict) else {}
 
 
-def new_api_recharge_logs(base_url, credential, session=None):
-    token = credential.get("access_token")
-    user_id = credential.get("user_id")
-    headers = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    if user_id:
-        headers["New-Api-User"] = str(user_id)
+def new_api_topup_logs(base_url, credential, session=None):
+    headers = new_api_headers(credential)
     client = session or requests.Session()
     resp = client.get(
         urljoin(base_url, "/api/user/topup/self"),
@@ -864,30 +1650,79 @@ def new_api_recharge_logs(base_url, credential, session=None):
     data = safe_json(resp)
     if resp.status_code >= 400 or not truthy_success(data):
         raise RuntimeError(read_message(data) or f"topup 记录读取失败 HTTP {resp.status_code}")
-    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)) else data
     logs = []
     for item in paginated_items(payload):
-        if not isinstance(item, dict) or not successful_new_api_topup(item.get("status")):
+        if not isinstance(item, dict) or not successful_new_api_topup_value(item):
             continue
-        amount = decimal_from(item.get("amount"))
+        _, amount = new_api_topup_amount(base_url, item)
         if amount is None or amount <= 0:
             continue
-        detected_at = stable_time(item.get("complete_time") or item.get("create_time")) or now_iso()
+        detected_at = stable_time(
+            item.get("complete_time") or item.get("completed_at") or item.get("paid_at") or item.get("create_time") or item.get("created_at")
+        ) or now_iso()
         logs.append({
             "amount_usd": amount,
             "detected_at": detected_at,
             "source_ref": source_hash(
                 "new_api",
                 item.get("id"),
+                item.get("trade_no"),
                 item.get("create_time"),
                 item.get("complete_time"),
                 item.get("status"),
                 amount,
             ),
             "source_status": item.get("status", ""),
-            "source_type": item.get("payment_method") or item.get("payment_provider") or "",
+            "source_type": item.get("payment_method") or item.get("payment_provider") or item.get("provider") or "",
         })
     return logs
+
+
+def new_api_log_recharge_logs(base_url, credential, session=None):
+    headers = new_api_headers(credential)
+    client = session or requests.Session()
+    quota_unit = None
+    logs = []
+    for log_type in (NEW_API_LOG_TYPE_TOPUP, NEW_API_LOG_TYPE_MANAGE):
+        resp = client.get(
+            urljoin(base_url, "/api/log/self"),
+            params={"p": 1, "page_size": 100, "type": log_type},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        data = safe_json(resp)
+        if resp.status_code >= 400 or not truthy_success(data):
+            raise RuntimeError(read_message(data) or f"log 记录读取失败 HTTP {resp.status_code}")
+        payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)) else data
+        for item in paginated_items(payload):
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("content") or "")
+            if not any(marker in content for marker in ("通过兑换码充值", "管理员增加用户额度", "管理员覆盖用户额度从")):
+                continue
+            if quota_unit is None:
+                quota_unit = get_new_api_quota_unit(base_url)
+            log = new_api_balance_log_item(base_url, item, quota_unit)
+            if log:
+                logs.append(log)
+    return logs
+
+
+def new_api_recharge_logs(base_url, credential, session=None):
+    logs = new_api_topup_logs(base_url, credential, session=session)
+    try:
+        logs.extend(new_api_log_recharge_logs(base_url, credential, session=session))
+    except (requests.RequestException, RuntimeError):
+        pass
+    return unique_recharge_logs(logs)
+
+
+def safe_new_api_recharge_logs(base_url, credential, session=None):
+    try:
+        return new_api_recharge_logs(base_url, credential, session=session)
+    except (requests.RequestException, RuntimeError):
+        return []
 
 
 def build_new_api_result(base_url, payload):
@@ -924,7 +1759,7 @@ def fetch_new_api(channel):
 
     if credential.get("access_token"):
         result = build_new_api_result(base_url, new_api_self(base_url, credential))
-        result["recharge_logs"] = new_api_recharge_logs(base_url, credential)
+        result["recharge_logs"] = safe_new_api_recharge_logs(base_url, credential)
         return result
 
     password_enc = channel_value(channel, "password_enc", "")
@@ -933,23 +1768,23 @@ def fetch_new_api(channel):
     session, user = new_api_login(base_url, channel["username"], decrypt(password_enc))
     credential = new_api_generate_token(base_url, session, user.get("id"))
     result = build_new_api_result(base_url, new_api_self(base_url, credential, session=session))
-    result["recharge_logs"] = new_api_recharge_logs(base_url, credential, session=session)
+    result["recharge_logs"] = safe_new_api_recharge_logs(base_url, credential, session=session)
     if channel_id:
         save_channel_credential(channel_id, credential)
     return result
 
 
-def provision_channel(platform, base_url, username, password):
+def provision_channel(platform, base_url, username, password, totp_code=""):
     if platform == "new_api":
-        session, user = new_api_login(base_url, username, password)
+        session, user = new_api_login(base_url, username, password, totp_code)
         credential = new_api_generate_token(base_url, session, user.get("id"))
         result = build_new_api_result(base_url, new_api_self(base_url, credential, session=session))
-        result["recharge_logs"] = new_api_recharge_logs(base_url, credential, session=session)
+        result["recharge_logs"] = safe_new_api_recharge_logs(base_url, credential, session=session)
         return credential, result
     if platform == "sub2api":
         credential, user = sub2api_login(base_url, username, password)
         result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]), user)
-        result["recharge_logs"] = sub2api_recharge_logs(base_url, credential["access_token"])
+        result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
         return credential, result
     raise RuntimeError(f"未知平台: {platform}")
 
@@ -1002,6 +1837,11 @@ def fetch_channel(channel):
 def persist_result(channel_id, result):
     checked_at = now_iso()
     with db() as conn:
+        previous_row = conn.execute("SELECT * FROM channels WHERE id = ?", (channel_id,)).fetchone()
+        logs = list(result.get("recharge_logs") or [])
+        inferred_log = balance_delta_recharge_log(channel_id, previous_row, result, checked_at)
+        if inferred_log:
+            logs.append(inferred_log)
         conn.execute(
             """
             UPDATE channels
@@ -1035,7 +1875,7 @@ def persist_result(channel_id, result):
         )
         row = conn.execute("SELECT * FROM channels WHERE id = ?", (channel_id,)).fetchone()
         if row:
-            sync_recharge_logs(conn, row, result.get("recharge_logs") or [])
+            sync_recharge_logs(conn, row, logs)
         record_balance_history(conn, channel_id, result, checked_at)
         prune_history(conn)
 
@@ -1082,7 +1922,7 @@ def refresh_all(send_notify=False):
                 results.append(row_to_channel(get_channel(row["id"])))
         send_low_balance_alerts(results)
         if send_notify and setting_get("notify_enabled", "1") == "1":
-            send_wecom_summary(results)
+            send_notification_summary(results)
         return results
 
 
@@ -1106,17 +1946,115 @@ def wecom_webhook():
     return decrypt(webhook_enc) if webhook_enc else ""
 
 
+def feishu_webhook():
+    webhook_enc = setting_get("feishu_webhook_enc")
+    return decrypt(webhook_enc) if webhook_enc else ""
+
+
+def notification_webhooks_configured():
+    return bool(wecom_webhook() or feishu_webhook())
+
+
+def low_balance_email_recipients(value=None):
+    raw = setting_get("low_balance_email_recipients", os.getenv("LOW_BALANCE_EMAIL_RECIPIENTS", "")) if value is None else value
+    return [item.strip() for item in re.split(r"[;,]", raw or "") if item.strip()]
+
+
+def low_balance_email_configured(recipients=None):
+    return bool(
+        LOW_BALANCE_EMAIL_ENABLED
+        and LOW_BALANCE_EMAIL_SMTP_SERVER
+        and LOW_BALANCE_EMAIL_SMTP_USER
+        and LOW_BALANCE_EMAIL_SMTP_TOKEN
+        and low_balance_email_recipients(recipients)
+    )
+
+
 def post_wecom_text(content):
     webhook = wecom_webhook()
     if not webhook:
         return False
     payload = {"msgtype": "text", "text": {"content": content}}
-    resp = requests.post(webhook, json=payload, timeout=REQUEST_TIMEOUT)
+    try:
+        resp = requests.post(webhook, json=payload, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        return False
     return resp.status_code < 400
 
 
-def send_wecom_summary(channels):
-    if not wecom_webhook():
+def feishu_response_ok(resp):
+    if resp.status_code >= 400:
+        return False
+    data = safe_json(resp)
+    if not isinstance(data, dict):
+        return True
+    code = data.get("code", data.get("StatusCode", 0))
+    return code in (0, "0", None)
+
+
+def post_feishu_text(content):
+    webhook = feishu_webhook()
+    if not webhook:
+        return False
+    payload = {"msg_type": "text", "content": {"text": content}}
+    try:
+        resp = requests.post(webhook, json=payload, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        return False
+    return feishu_response_ok(resp)
+
+
+def post_notification_text(content):
+    sent = []
+    try:
+        wecom_sent = post_wecom_text(content)
+    except requests.RequestException:
+        wecom_sent = False
+    try:
+        feishu_sent = post_feishu_text(content)
+    except requests.RequestException:
+        feishu_sent = False
+    if wecom_sent:
+        sent.append("wecom")
+    if feishu_sent:
+        sent.append("feishu")
+    return sent
+
+
+def html_body_from_text(content):
+    escaped = (
+        str(content)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\n", "<br>")
+    )
+    return f"<div style=\"font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;line-height:1.6\">{escaped}</div>"
+
+
+def post_low_balance_email(subject, content):
+    recipients = low_balance_email_recipients()
+    if not low_balance_email_configured():
+        return False
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = LOW_BALANCE_EMAIL_FROM
+    message["To"] = ", ".join(recipients)
+    message.set_content(content)
+    message.add_alternative(html_body_from_text(content), subtype="html")
+    try:
+        with smtplib.SMTP(LOW_BALANCE_EMAIL_SMTP_SERVER, LOW_BALANCE_EMAIL_SMTP_PORT, timeout=REQUEST_TIMEOUT) as smtp:
+            smtp.starttls()
+            smtp.login(LOW_BALANCE_EMAIL_SMTP_USER, LOW_BALANCE_EMAIL_SMTP_TOKEN)
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException) as exc:
+        print(f"[low-balance-email] failed: {exc}", flush=True)
+        return False
+    return True
+
+
+def send_notification_summary(channels):
+    if not notification_webhooks_configured():
         return False
     ok_count = sum(1 for item in channels if item.get("status") == "ok")
     lines = [
@@ -1133,7 +2071,11 @@ def send_wecom_summary(channels):
         used_text = f", used {format_money(used)}" if used is not None else ""
         message = f" - {item.get('message')}" if item.get("status") != "ok" and item.get("message") else ""
         lines.append(f"{icon} {name}: {balance} {item.get('currency', 'USD')}{used_text}{message}")
-    return post_wecom_text("\n".join(lines))
+    return bool(post_notification_text("\n".join(lines)))
+
+
+def send_wecom_summary(channels):
+    return send_notification_summary(channels)
 
 
 def low_balance_alert_key(channel_id):
@@ -1146,8 +2088,9 @@ def should_send_low_balance_alert(channel):
     cny_balance = decimal_from(channel.get("cny_balance"))
     if cny_balance is None:
         return False
+    threshold = alert_threshold_from(channel.get("alert_cny"))
     key = low_balance_alert_key(channel["id"])
-    if cny_balance > LOW_BALANCE_ALERT_CNY:
+    if cny_balance > threshold:
         setting_delete(key)
         return False
     alerted_at = parse_iso_timestamp(setting_get(key))
@@ -1157,21 +2100,21 @@ def should_send_low_balance_alert(channel):
 
 
 def send_low_balance_alerts(channels):
-    if setting_get("notify_enabled", "1") != "1" or not wecom_webhook():
+    if setting_get("notify_enabled", "1") != "1":
         return []
     sent = []
     for channel in channels:
         if not should_send_low_balance_alert(channel):
             continue
         lines = [
-            "上游余额告警",
-            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"渠道: {channel.get('name') or channel.get('base_url')}",
-            f"URL: {channel.get('base_url')}",
-            f"余额: {format_money(channel.get('balance'))} USD / {format_money(channel.get('cny_balance'))} CNY",
-            f"阈值: {format_money(as_float(LOW_BALANCE_ALERT_CNY))} CNY",
+            f"渠道名: {channel.get('name') or channel.get('base_url')}",
+            f"余额: {format_money(channel.get('cny_balance'))} CNY",
+            f"阈值: {format_money(as_float(alert_threshold_from(channel.get('alert_cny'))))} CNY",
         ]
-        if post_wecom_text("\n".join(lines)):
+        content = "\n".join(lines)
+        notify_sent = post_notification_text(content) if notification_webhooks_configured() else []
+        email_sent = post_low_balance_email("上游余额告警", content)
+        if notify_sent or email_sent:
             setting_set(low_balance_alert_key(channel["id"]), now_iso())
             sent.append(channel)
     return sent
@@ -1184,7 +2127,12 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify({"ok": True, "time": now_iso()})
+    try:
+        with db() as conn:
+            conn.execute("SELECT 1").fetchone()
+        return jsonify({"ok": True, "database": "ready", "time": now_iso()})
+    except Exception:
+        return jsonify({"ok": False, "database": "unavailable", "time": now_iso()}), 503
 
 
 @app.get("/api/auth/bootstrap")
@@ -1196,7 +2144,7 @@ def auth_bootstrap():
 def auth_register():
     if user_count() > 0:
         return response_error("管理员账号已创建", 403)
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
     if len(username) < 3:
@@ -1209,15 +2157,14 @@ def auth_register():
             "INSERT INTO users(username, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?)",
             (username, generate_password_hash(password), ts, ts),
         )
-    session.clear()
-    session.permanent = True
-    session["user_id"] = cur.lastrowid
-    return jsonify({"ok": True, "data": auth_state()})
+    user = get_user(cur.lastrowid)
+    setup_login(user)
+    return jsonify({"ok": True, "data": auth_state(user)})
 
 
 @app.post("/api/auth/login")
 def auth_login():
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
     row = get_user_by_username(username)
@@ -1225,15 +2172,13 @@ def auth_login():
         return response_error("账号或密码错误", 401)
     if row["totp_enabled"] and not verify_totp(row["totp_secret"], payload.get("totp")):
         return response_error("2FA 验证码错误", 401)
-    session.clear()
-    session.permanent = True
-    session["user_id"] = row["id"]
-    return jsonify({"ok": True, "data": auth_state()})
+    setup_login(row)
+    return jsonify({"ok": True, "data": auth_state(row)})
 
 
 @app.post("/api/auth/logout")
 def auth_logout():
-    session.clear()
+    clear_login()
     return jsonify({"ok": True})
 
 
@@ -1253,19 +2198,21 @@ def auth_2fa_confirm():
     row = current_user()
     if not row["totp_secret"]:
         return response_error("请先生成 2FA 密钥")
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     if not verify_totp(row["totp_secret"], payload.get("totp")):
         return response_error("2FA 验证码错误", 401)
     with db() as conn:
         conn.execute("UPDATE users SET totp_enabled = 1, updated_at = ? WHERE id = ?", (now_iso(), row["id"]))
-    return jsonify({"ok": True, "data": auth_state()})
+    updated = get_user(row["id"])
+    setup_login(updated)
+    return jsonify({"ok": True, "data": auth_state(updated)})
 
 
 @app.post("/api/auth/2fa/disable")
 @login_required
 def auth_2fa_disable():
     row = current_user()
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     if not check_password_hash(row["password_hash"], payload.get("password") or ""):
         return response_error("密码错误", 401)
     with db() as conn:
@@ -1279,16 +2226,94 @@ def get_settings():
     return jsonify({"ok": True, "data": public_settings()})
 
 
+@app.get("/api/opencode/accounts")
+@login_required
+def api_opencode_accounts():
+    force = request.args.get("refresh") == "1"
+    try:
+        data = load_opencode_accounts(force=force, reject_if_busy=True)
+    except OpenCodeRefreshBusy as exc:
+        return response_error(str(exc), 409)
+    return jsonify({"ok": True, "data": data, "fetched_at": now_iso()})
+
+
+@app.post("/api/opencode/accounts")
+@login_required
+def api_create_opencode_account():
+    try:
+        account = save_opencode_account(request_payload(force=True))
+    except ValueError as exc:
+        return response_error(str(exc))
+    return jsonify({"ok": True, "data": account})
+
+
+@app.put("/api/opencode/accounts/<int:account_id>")
+@login_required
+def api_update_opencode_account(account_id):
+    try:
+        account = save_opencode_account(request_payload(force=True), account_id=account_id)
+    except LookupError as exc:
+        return response_error(str(exc), 404)
+    except ValueError as exc:
+        return response_error(str(exc))
+    return jsonify({"ok": True, "data": account})
+
+
+@app.delete("/api/opencode/accounts/<int:account_id>")
+@login_required
+def api_delete_opencode_account(account_id):
+    if not get_opencode_account(account_id):
+        return response_error("OpenCode Go 账号不存在", 404)
+    with db() as conn:
+        conn.execute("DELETE FROM opencode_accounts WHERE id = ?", (account_id,))
+    clear_opencode_cache(account_id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/opencode/refresh")
+@login_required
+def api_refresh_opencode_accounts():
+    try:
+        data = load_opencode_accounts(force=True, reject_if_busy=True)
+    except OpenCodeRefreshBusy as exc:
+        return response_error(str(exc), 409)
+    return jsonify({"ok": True, "data": data, "fetched_at": now_iso()})
+
+
+@app.get("/api/opencode/alerts")
+@login_required
+def api_opencode_alerts():
+    return jsonify({"ok": True, "data": public_opencode_alert_status()})
+
+
+@app.post("/api/opencode/alerts/test")
+@login_required
+def api_test_opencode_alerts():
+    if not opencode_notifications_enabled():
+        return response_error("请先配置企业微信、飞书或低余额邮箱")
+    if not deliver_opencode_event({"type": "test"}):
+        return response_error("OpenCode Go 告警测试发送失败", 502)
+    return jsonify({"ok": True})
+
+
 @app.put("/api/settings")
 @login_required
 def update_settings():
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     if "wecom_webhook" in payload:
         webhook = (payload.get("wecom_webhook") or "").strip()
         if webhook:
             setting_set("wecom_webhook_enc", encrypt(webhook))
         elif payload.get("clear_wecom"):
             setting_set("wecom_webhook_enc", "")
+    if "feishu_webhook" in payload:
+        webhook = (payload.get("feishu_webhook") or "").strip()
+        if webhook:
+            setting_set("feishu_webhook_enc", encrypt(webhook))
+        elif payload.get("clear_feishu"):
+            setting_set("feishu_webhook_enc", "")
+    if "low_balance_email_recipients" in payload:
+        setting_set("low_balance_email_recipients", (payload.get("low_balance_email_recipients") or "").strip())
     if "notify_enabled" in payload:
         setting_set("notify_enabled", "1" if payload.get("notify_enabled") else "0")
     return jsonify({"ok": True, "data": public_settings()})
@@ -1311,6 +2336,38 @@ def test_wecom():
     return jsonify({"ok": True})
 
 
+@app.post("/api/settings/test-feishu")
+@login_required
+def test_feishu():
+    webhook_enc = setting_get("feishu_webhook_enc")
+    if not webhook_enc:
+        return response_error("请先保存飞书 webhook")
+    webhook = decrypt(webhook_enc)
+    payload = {
+        "msg_type": "text",
+        "content": {"text": f"light-metapi 测试消息\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"},
+    }
+    resp = requests.post(webhook, json=payload, timeout=REQUEST_TIMEOUT)
+    if not feishu_response_ok(resp):
+        return response_error(f"飞书返回 HTTP {resp.status_code}: {resp.text[:300]}", 502)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/settings/test-email")
+@login_required
+def test_email():
+    if not low_balance_email_configured():
+        return response_error("请先配置低余额邮箱")
+    content = "\n".join([
+        "渠道名: 邮件测试",
+        "余额: 0 CNY",
+        f"阈值: {format_money(as_float(LOW_BALANCE_ALERT_CNY))} CNY",
+    ])
+    if not post_low_balance_email("上游余额告警测试", content):
+        return response_error("邮件发送失败", 502)
+    return jsonify({"ok": True})
+
+
 @app.get("/api/channels")
 @login_required
 def api_list_channels():
@@ -1329,13 +2386,20 @@ def api_recharge_logs():
 @app.post("/api/channels")
 @login_required
 def api_create_channel():
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     name = (payload.get("name") or "").strip()
     platform = (payload.get("platform") or "").strip()
-    base_url = normalize_url(payload.get("base_url"))
+    try:
+        base_url = normalize_url(payload.get("base_url"))
+    except ValueError as exc:
+        log_channel_create(platform, payload.get("base_url"), payload.get("username"), f"failed: {exc}")
+        return response_error(str(exc))
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
+    totp_code = payload.get("totp") or payload.get("totp_code") or ""
     cny_rate = rate_from(payload.get("cny_rate"))
+    alert_cny = alert_threshold_from(payload.get("alert_cny"))
+    boss_recharge_required = 1 if payload.get("boss_recharge_required") else 0
     if platform not in ("new_api", "sub2api"):
         return response_error("平台只支持 new_api 或 sub2api")
     if not name:
@@ -1343,19 +2407,20 @@ def api_create_channel():
     if not username or not password:
         return response_error("账号和密码必填")
     try:
-        credential, result = provision_channel(platform, base_url, username, password)
+        credential, result = provision_channel(platform, base_url, username, password, totp_code)
     except Exception as exc:
+        log_channel_create(platform, base_url, username, f"failed: {exc}")
         return response_error(f"测试失败: {exc}", 502)
     ts = now_iso()
     with db() as conn:
         cur = conn.execute(
             """
             INSERT INTO channels(
-                name, platform, base_url, username, password_enc, credential_enc, cny_rate, enabled,
-                balance, raw_balance, used_balance, raw_used_balance, request_count,
+                name, platform, base_url, username, password_enc, credential_enc, cny_rate, alert_cny, enabled,
+                boss_recharge_required, balance, raw_balance, used_balance, raw_used_balance, request_count,
                 currency, status, message, raw_response, last_checked_at, created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
@@ -1364,7 +2429,9 @@ def api_create_channel():
                 username,
                 encrypt(json.dumps(credential, ensure_ascii=False)),
                 as_float(cny_rate),
+                as_float(alert_cny),
                 1,
+                boss_recharge_required,
                 as_float(result.get("balance")),
                 result.get("raw_balance"),
                 as_float(result.get("used_balance")),
@@ -1381,9 +2448,10 @@ def api_create_channel():
         )
         row = conn.execute("SELECT * FROM channels WHERE id = ?", (cur.lastrowid,)).fetchone()
         if row:
-            sync_recharge_logs(conn, row, result.get("recharge_logs") or [])
+            safe_sync_recharge_logs(conn, row, result.get("recharge_logs") or [])
         record_balance_history(conn, cur.lastrowid, result, ts)
         prune_history(conn)
+    log_channel_create(platform, base_url, username, f"saved id={cur.lastrowid}")
     return jsonify({"ok": True, "data": row_to_channel(get_channel(cur.lastrowid))})
 
 
@@ -1393,21 +2461,24 @@ def api_update_channel(channel_id):
     row = get_channel(channel_id)
     if not row:
         return response_error("渠道不存在", 404)
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request_payload(force=True)
     name = (payload.get("name") or row["name"]).strip()
     platform = (payload.get("platform") or row["platform"]).strip()
     base_url = normalize_url(payload.get("base_url") or row["base_url"])
     username = (payload.get("username") or row["username"]).strip()
     enabled = 1 if payload.get("enabled", row["enabled"]) else 0
     cny_rate = rate_from(payload.get("cny_rate", row["cny_rate"]))
+    alert_cny = alert_threshold_from(payload.get("alert_cny"), channel_value(row, "alert_cny"))
+    boss_recharge_required = 1 if payload.get("boss_recharge_required", channel_value(row, "boss_recharge_required", 0)) else 0
     if platform not in ("new_api", "sub2api"):
         return response_error("平台只支持 new_api 或 sub2api")
     password = payload.get("password") or ""
+    totp_code = payload.get("totp") or payload.get("totp_code") or ""
     credential_enc = channel_value(row, "credential_enc", "")
     result = None
     if password:
         try:
-            credential, result = provision_channel(platform, base_url, username, password)
+            credential, result = provision_channel(platform, base_url, username, password, totp_code)
             credential_enc = encrypt(json.dumps(credential, ensure_ascii=False))
         except Exception as exc:
             return response_error(f"测试失败: {exc}", 502)
@@ -1424,7 +2495,9 @@ def api_update_channel(channel_id):
                     password_enc = '',
                     credential_enc = ?,
                     cny_rate = ?,
+                    alert_cny = ?,
                     enabled = ?,
+                    boss_recharge_required = ?,
                     balance = ?,
                     raw_balance = ?,
                     used_balance = ?,
@@ -1445,7 +2518,9 @@ def api_update_channel(channel_id):
                     username,
                     credential_enc,
                     as_float(cny_rate),
+                    as_float(alert_cny),
                     enabled,
+                    boss_recharge_required,
                     as_float(result.get("balance")),
                     result.get("raw_balance"),
                     as_float(result.get("used_balance")),
@@ -1476,11 +2551,25 @@ def api_update_channel(channel_id):
                     credential_enc = ?,
                     password_enc = '',
                     cny_rate = ?,
+                    alert_cny = ?,
                     enabled = ?,
+                    boss_recharge_required = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (name, platform, base_url, username, credential_enc, as_float(cny_rate), enabled, ts, channel_id),
+                (
+                    name,
+                    platform,
+                    base_url,
+                    username,
+                    credential_enc,
+                    as_float(cny_rate),
+                    as_float(alert_cny),
+                    enabled,
+                    boss_recharge_required,
+                    ts,
+                    channel_id,
+                ),
             )
     return jsonify({"ok": True, "data": row_to_channel(get_channel(channel_id))})
 
@@ -1506,13 +2595,26 @@ def api_refresh_channel(channel_id):
 @app.post("/api/refresh")
 @login_required
 def api_refresh_all():
-    payload = request.get_json(silent=True) or {}
+    payload = request_payload()
     data = refresh_all(send_notify=bool(payload.get("notify")))
     return jsonify({"ok": True, "data": data})
 
 
+def register_api_aliases():
+    for rule in list(app.url_map.iter_rules()):
+        if not rule.rule.startswith("/api/"):
+            continue
+        alias = "/_ub_api/" + rule.rule[len("/api/"):]
+        endpoint = f"ub_alias_{rule.endpoint}"
+        if endpoint in app.view_functions:
+            continue
+        methods = set(rule.methods)
+        app.add_url_rule(alias, endpoint, app.view_functions[rule.endpoint], methods=methods)
+
+
 def scheduler_loop():
     last_notify_at = 0.0
+    last_opencode_alert_at = 0.0
     while True:
         time.sleep(REFRESH_INTERVAL_SECONDS)
         try:
@@ -1522,6 +2624,9 @@ def scheduler_loop():
                 last_notify_at = time.time()
         except Exception as exc:
             print(f"[scheduler] refresh failed: {exc}", flush=True)
+        if time.time() - last_opencode_alert_at >= OPENCODE_GO_ALERT_INTERVAL_SECONDS:
+            run_opencode_alert_monitor()
+            last_opencode_alert_at = time.time()
 
 
 def start_scheduler():
@@ -1530,6 +2635,8 @@ def start_scheduler():
 
 
 init_db()
+import_opencode_accounts()
+register_api_aliases()
 start_scheduler()
 
 

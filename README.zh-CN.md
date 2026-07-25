@@ -4,6 +4,8 @@ light-metapi 是一个轻量上游余额监控工具，当前支持 New API 和 
 
 [English README](README.md) | [引用说明](CITATION.md)
 
+CY16 的受审核部署、自动回滚和员工权限流程见 [CY16 安全部署手册](DEPLOYMENT.md)。
+
 ## 效果预览
 
 ![安全登录页面](docs/images/login.png)
@@ -20,6 +22,9 @@ light-metapi 是一个轻量上游余额监控工具，当前支持 New API 和 
 - 企业微信每小时汇总推送。
 - 折算 CNY 余额低于阈值时发送告警。
 - SQLite 数据库，Docker 单服务部署。
+- OpenCode Go 多账号额度子页，读取 5 小时、每周、每月三个窗口。
+- OpenCode Go Cookie 与 API Key 复用现有加密存储和管理员登录。
+- OpenCode Go 额度在 20%、5%、0% 时复用企业微信、飞书和邮件告警。
 
 ## 快速运行
 
@@ -38,7 +43,7 @@ Docker:
 docker compose up -d --build
 ```
 
-`docker-compose.yml` 默认绑定 `127.0.0.1:8756`，适合放在 HTTPS 反向代理后面使用。
+`docker-compose.yml` 默认绑定 `127.0.0.1:8756`，适合放在 HTTPS 反向代理后面使用。容器硬内存上限为 512 MiB、内存预留为 192 MiB、交换区总上限为 768 MiB，并限制最多 128 个进程。
 
 ## 使用方式
 
@@ -54,6 +59,10 @@ docker compose up -d --build
 - SQLite 数据库：`data/upstreams.sqlite3`
 - 加密密钥：`data/secret.key`
 - Session 密钥：`data/session.secret`
+- OpenCode Go 账号：`opencode_accounts` 表，Cookie 与 API Key 使用 `data/secret.key` 加密。
+
+从独立 OpenCode Go 看板迁移时，可以把原 `config.json` 临时复制为
+`data/opencode-import.json`。服务首次启动会导入账号、加密凭据并立即删除这个明文导入文件。
 
 添加渠道时，系统会使用提交的上游账号密码完成一次登录测试。测试成功后，本地保存加密后的上游访问令牌，并清空密码字段。企业微信 webhook 使用本机密钥加密后存储。
 
@@ -85,6 +94,10 @@ docker compose up -d --build
 | `LOW_BALANCE_ALERT_CNY` | `100` | 低余额告警阈值 |
 | `LOW_BALANCE_ALERT_COOLDOWN_SECONDS` | `21600` | 单渠道告警冷却时间 |
 | `UPSTREAM_REQUEST_TIMEOUT` | `25` | 上游请求超时时间 |
+| `OPENCODE_GO_ALERT_INTERVAL_SECONDS` | `60` | OpenCode Go 告警检查间隔 |
+| `OPENCODE_GO_ALERT_THRESHOLDS` | `20,5,0` | OpenCode Go 剩余额度告警线 |
+| `OPENCODE_GO_REFRESH_DEADLINE_SECONDS` | `50` | 一次多账号刷新整体等待上限，超时后返回部分结果 |
+| `OPENCODE_GO_IMPORT_FILE` | `data/opencode-import.json` | 一次性明文迁移文件，成功处理后自动删除 |
 
 ## 接口
 
@@ -103,3 +116,10 @@ docker compose up -d --build
 - `GET /api/recharges`
 - `GET /api/settings`
 - `PUT /api/settings`
+- `GET /api/opencode/accounts`
+- `POST /api/opencode/accounts`
+- `PUT /api/opencode/accounts/:id`
+- `DELETE /api/opencode/accounts/:id`
+- `POST /api/opencode/refresh`
+- `GET /api/opencode/alerts`
+- `POST /api/opencode/alerts/test`

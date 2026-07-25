@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+/config.json
+opencode-import*.json
+.venv
+__pycache__
+*.pyc
+*.sqlite3
+*.db
+*.secret
+data
+docs
+tests
+ui-preview/node_modules
+ui-preview/.vite
+ui-preview/*.tsbuildinfo

@@ -1,7 +1,9 @@
+name: upstream-balance-rollback
+
 services:
   upstream-balance:
-    build: .
-    container_name: upstream-balance
+    image: ${UPSTREAM_BALANCE_IMAGE:?UPSTREAM_BALANCE_IMAGE is required}
+    container_name: ${UPSTREAM_BALANCE_CONTAINER_NAME:-upstream-balance}
     user: "1000:1000"
     restart: unless-stopped
     init: true
@@ -15,6 +17,9 @@ services:
     mem_reservation: 192m
     memswap_limit: 768m
     pids_limit: 128
+    env_file:
+      - path: ${UPSTREAM_BALANCE_ENV_FILE:?UPSTREAM_BALANCE_ENV_FILE is required}
+        required: true
     environment:
       HOST: 0.0.0.0
       PORT: 8756
@@ -26,31 +31,19 @@ services:
       LOW_BALANCE_ALERT_CNY: 100
       LOW_BALANCE_ALERT_COOLDOWN_SECONDS: 21600
       UPSTREAM_REQUEST_TIMEOUT: 25
-      OPENCODE_GO_ALERT_INTERVAL_SECONDS: 60
+      OPENCODE_GO_ALERT_INTERVAL_SECONDS: ${OPENCODE_GO_ALERT_INTERVAL_SECONDS:-300}
       OPENCODE_GO_ALERT_THRESHOLDS: 20,5,0
       OPENCODE_GO_REFRESH_DEADLINE_SECONDS: 50
       SESSION_COOKIE_NAME: ub_admin_session
       SESSION_COOKIE_PATH: /upstream-balance
-      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-0}
-      LOW_BALANCE_EMAIL_ENABLED: ${LOW_BALANCE_EMAIL_ENABLED:-0}
-      LOW_BALANCE_EMAIL_RECIPIENTS: ${LOW_BALANCE_EMAIL_RECIPIENTS:-}
-      LOW_BALANCE_EMAIL_FROM: ${LOW_BALANCE_EMAIL_FROM:-noreply@mail.sandboxai.top}
-      LOW_BALANCE_EMAIL_SMTP_SERVER: ${LOW_BALANCE_EMAIL_SMTP_SERVER:-smtp.resend.com}
-      LOW_BALANCE_EMAIL_SMTP_PORT: ${LOW_BALANCE_EMAIL_SMTP_PORT:-2587}
-      LOW_BALANCE_EMAIL_SMTP_USER: ${LOW_BALANCE_EMAIL_SMTP_USER:-resend}
-      LOW_BALANCE_EMAIL_SMTP_TOKEN: ${LOW_BALANCE_EMAIL_SMTP_TOKEN:-}
+      SESSION_COOKIE_SECURE: "1"
     ports:
-      - "127.0.0.1:8756:8756"
+      - ${UPSTREAM_BALANCE_BIND:-127.0.0.1:8756}:8756
     volumes:
-      - ${UPSTREAM_BALANCE_DATA_HOST_DIR:-./data}:/app/data
+      - ${UPSTREAM_BALANCE_DATA_DIR:?UPSTREAM_BALANCE_DATA_DIR is required}:/app/data
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
     stop_grace_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "3"
     healthcheck:
       test:
         - CMD
@@ -61,3 +54,8 @@ services:
       timeout: 6s
       retries: 3
       start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
