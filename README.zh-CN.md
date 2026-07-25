@@ -22,9 +22,9 @@ CY16 的受审核部署、自动回滚和员工权限流程见 [CY16 安全部�
 - 企业微信每小时汇总推送。
 - 折算 CNY 余额低于阈值时发送告警。
 - SQLite 数据库，Docker 单服务部署。
-- OpenCode Go 多账号额度子页，读取 5 小时、每周、每月三个窗口。
+- OpenCode Go 多账号额度子页，读取 5 小时、每周、每月三个窗口，并折算为美元池余额。
 - OpenCode Go Cookie 与 API Key 复用现有加密存储和管理员登录。
-- OpenCode Go 额度在 20%、5%、0% 时复用企业微信、飞书和邮件告警。
+- OpenCode Go 池剩余低于阈值时复用企业微信、飞书和邮件告警（默认 5 小时 &lt; $20、每周 &lt; $80、每月 &lt; $300）。
 
 ## 快速运行
 
@@ -95,8 +95,10 @@ docker compose up -d --build
 | `LOW_BALANCE_ALERT_COOLDOWN_SECONDS` | `21600` | 单渠道告警冷却时间 |
 | `UPSTREAM_REQUEST_TIMEOUT` | `25` | 上游请求超时时间 |
 | `OPENCODE_GO_ALERT_INTERVAL_SECONDS` | `60` | OpenCode Go 告警检查间隔 |
-| `OPENCODE_GO_ALERT_THRESHOLDS` | `20,5,0` | OpenCode Go 剩余额度告警线 |
-| `OPENCODE_GO_REFRESH_DEADLINE_SECONDS` | `50` | 一次多账号刷新整体等待上限，超时后返回部分结果 |
+| `OPENCODE_GO_ALERT_THRESHOLDS` | `20,5,0` | 兼容保留的单账号剩余百分比告警线（默认关闭） |
+| `OPENCODE_GO_POOL_ALERT_USD` | `rolling=20,weekly=80,monthly=300` | OpenCode Go 池剩余美元告警线 |
+| `OPENCODE_GO_REFRESH_DEADLINE_SECONDS` | `90` | 一次多账号刷新整体等待上限，超时后返回部分结果 |
+| `OPENCODE_GO_REFRESH_WORKERS` | `16` | OpenCode Go 并发刷新线程数 |
 | `OPENCODE_GO_IMPORT_FILE` | `data/opencode-import.json` | 一次性明文迁移文件，成功处理后自动删除 |
 
 ## 接口
