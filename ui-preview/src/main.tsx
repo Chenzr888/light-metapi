@@ -52,6 +52,8 @@ import type {
   OpenCodeAccount,
   OpenCodeAlertStatus,
   OpenCodeDraft,
+  OpenCodePool,
+  OpenCodePoolWindow,
   OpenCodeWindow,
   Platform,
   RechargeLog,
@@ -127,6 +129,18 @@ function quotaTone(remaining: number) {
   if (remaining <= 5) return "danger";
   if (remaining <= 20) return "warn";
   return "ok";
+}
+
+function poolTone(window?: OpenCodePoolWindow | null) {
+  if (!window || window.samples <= 0) return "";
+  if (window.belowThreshold || window.remainingUsd <= window.alertThresholdUsd) return "danger";
+  if (window.remainingUsd <= window.alertThresholdUsd * 1.5) return "warn";
+  return "ok";
+}
+
+function usd(value: number | null | undefined, digits = 2) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "--";
+  return `$${money(value, digits)}`;
 }
 
 function openCodeNeedsAttention(account: OpenCodeAccount) {
@@ -213,6 +227,7 @@ function Sparkline({ values }: { values: number[] }) {
 
 function OpenCodeWorkspace({
   accounts,
+  pool,
   alerts,
   syncing,
   loadError,
@@ -223,6 +238,7 @@ function OpenCodeWorkspace({
   onTestAlerts,
 }: {
   accounts: OpenCodeAccount[];
+  pool: OpenCodePool | null;
   alerts: OpenCodeAlertStatus | null;
   syncing: boolean;
   loadError: string;
@@ -238,13 +254,11 @@ function OpenCodeWorkspace({
 
   const active = accounts.filter((account) => account.quota && !account.quotaError).length;
   const warnings = accounts.filter(openCodeNeedsAttention).length;
-  const aggregateWindows = useMemo(() => openCodeWindowKeys.map((key) => {
-    const values = accounts
-      .map((account) => account.quota?.windows[key]?.usedPercent)
-      .filter((value): value is number => typeof value === "number");
-    const average = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
-    return { key, label: openCodeWindowLabels[key], average, samples: values.length };
-  }), [accounts]);
+  const poolWindows = useMemo(
+    () => openCodeWindowKeys.map((key) => pool?.windows[key] || null),
+    [pool],
+  );
+  const poolAlerts = alerts?.poolThresholdsUsd || { rolling: 20, weekly: 80, monthly: 300 };
   const visibleAccounts = useMemo(() => accounts
     .filter((account) => {
       const haystack = `${account.label} ${account.accountKey} ${account.workspaceId || ""}`.toLowerCase();
@@ -265,7 +279,7 @@ function OpenCodeWorkspace({
       <header className="topbar opencode-topbar">
         <div>
           <p className="eyebrow">OpenCode Go 统一监控</p>
-          <h1>账号额度</h1>
+          <h1>池额度</h1>
         </div>
         <div className="top-actions">
           <button className="icon-button" onClick={onRefresh} disabled={syncing} title="刷新 OpenCode Go">
@@ -306,14 +320,24 @@ function OpenCodeWorkspace({
             </div>
           </div>
 
-          <div className="opencode-aggregate" aria-label="平均额度消耗">
-            {aggregateWindows.map((window) => {
-              const remaining = window.average === null ? 100 : 100 - window.average;
+          <div className="opencode-aggregate" aria-label="OpenCode Go 池美元额度">
+            {openCodeWindowKeys.map((key, index) => {
+              const window = poolWindows[index];
+              const usedRatio = window && window.totalUsd > 0
+                ? Math.max(0, Math.min(100, (window.usedUsd / window.totalUsd) * 100))
+                : 0;
               return (
-                <div className={`opencode-aggregate-item ${quotaTone(remaining)}`} key={window.key}>
-                  <div><span>{window.label} 平均已用</span><strong>{window.average === null ? "--" : `${money(window.average, 1)}%`}</strong></div>
-                  <div className="opencode-aggregate-track" aria-hidden="true"><i style={{ width: `${window.average || 0}%` }} /></div>
-                  <small>{window.samples ? `${window.samples} 个账号有实时数据` : "等待首次刷新"}</small>
+                <div className={`opencode-aggregate-item ${poolTone(window)}`} key={key}>
+                  <div>
+                    <span>{openCodeWindowLabels[key]} 池剩余</span>
+                    <strong>{window ? usd(window.remainingUsd) : "--"}</strong>
+                  </div>
+                  <div className="opencode-aggregate-track" aria-hidden="true"><i style={{ width: `${usedRatio}%` }} /></div>
+                  <small>
+                    {window && window.samples
+                      ? `已用 ${usd(window.usedUsd)} / 总池 ${usd(window.totalUsd)} · 告警 < ${usd(window.alertThresholdUsd, 0)} · ${window.samples}/${window.accountCount} 账号`
+                      : "等待首次刷新"}
+                  </small>
                 </div>
               );
             })}
@@ -412,12 +436,12 @@ function OpenCodeWorkspace({
 
       <section className="panel opencode-alert-panel">
         <div className="section-head compact">
-          <div><h2>额度告警</h2><p>复用当前企业微信、飞书和邮件通道。</p></div>
+          <div><h2>池额度告警</h2><p>复用当前企业微信、飞书和邮件通道；监控三个美元池剩余。</p></div>
           <button className="text-button" onClick={onTestAlerts} disabled={!alerts?.enabled || syncing}>发送测试</button>
         </div>
         <div className="alert-stack horizontal-alerts">
           <div><CheckCircle2 size={18} /> {alerts?.enabled ? "监控运行中" : "配置通知通道后启用"}</div>
-          <div><Bell size={18} /> 阈值 {alerts?.thresholds?.join(" / ") || "20 / 5 / 0"}%</div>
+          <div><Bell size={18} /> {`5H < $${poolAlerts.rolling} / 周 < $${poolAlerts.weekly} / 月 < $${poolAlerts.monthly}`}</div>
           <div><Clock3 size={18} /> 每 {alerts?.intervalSeconds || 60} 秒检查</div>
           <div className={alerts?.lastError ? "alert-error" : ""}><AlertTriangle size={18} /> {alerts?.lastError || `已发送 ${alerts?.deliveredEvents || 0} 条事件`}</div>
         </div>
@@ -444,6 +468,7 @@ function App() {
   const [twofaCode, setTwofaCode] = useState("");
   const [activeView, setActiveView] = useState<ViewMode>("balance");
   const [openCodeAccounts, setOpenCodeAccounts] = useState<OpenCodeAccount[]>([]);
+  const [openCodePool, setOpenCodePool] = useState<OpenCodePool | null>(null);
   const [openCodeAlerts, setOpenCodeAlerts] = useState<OpenCodeAlertStatus | null>(null);
   const [openCodeLoaded, setOpenCodeLoaded] = useState(false);
   const [openCodeLoadError, setOpenCodeLoadError] = useState("");
@@ -526,8 +551,9 @@ function App() {
     setSyncing(true);
     setOpenCodeLoadError("");
     try {
-      const [accounts, alerts] = await Promise.all([loadOpenCodeAccounts(), loadOpenCodeAlerts()]);
-      setOpenCodeAccounts(accounts);
+      const [bundle, alerts] = await Promise.all([loadOpenCodeAccounts(), loadOpenCodeAlerts()]);
+      setOpenCodeAccounts(bundle.accounts);
+      setOpenCodePool(bundle.pool);
       setOpenCodeAlerts(alerts);
       setOpenCodeLoaded(true);
     } catch (error) {
@@ -543,8 +569,9 @@ function App() {
     setSyncing(true);
     setOpenCodeLoadError("");
     try {
-      const [accounts, alerts] = await Promise.all([refreshOpenCodeAccounts(), loadOpenCodeAlerts()]);
-      setOpenCodeAccounts(accounts);
+      const [bundle, alerts] = await Promise.all([refreshOpenCodeAccounts(), loadOpenCodeAlerts()]);
+      setOpenCodeAccounts(bundle.accounts);
+      setOpenCodePool(bundle.pool);
       setOpenCodeAlerts(alerts);
       setOpenCodeLoaded(true);
       showToast("OpenCode Go 额度已刷新");
@@ -573,8 +600,9 @@ function App() {
     try {
       await saveOpenCodeAccount(openCodeDraft, openCodeEditorId ?? undefined);
       setOpenCodeEditorId(undefined);
-      const [accounts, alerts] = await Promise.all([refreshOpenCodeAccounts(), loadOpenCodeAlerts()]);
-      setOpenCodeAccounts(accounts);
+      const [bundle, alerts] = await Promise.all([refreshOpenCodeAccounts(), loadOpenCodeAlerts()]);
+      setOpenCodeAccounts(bundle.accounts);
+      setOpenCodePool(bundle.pool);
       setOpenCodeAlerts(alerts);
       setOpenCodeLoaded(true);
       showToast(openCodeEditorId ? "OpenCode Go 账号已更新" : "OpenCode Go 账号已添加");
@@ -590,7 +618,9 @@ function App() {
     setSyncing(true);
     try {
       await deleteOpenCodeAccount(account.id);
-      setOpenCodeAccounts((items) => items.filter((item) => item.id !== account.id));
+      const bundle = await loadOpenCodeAccounts(true);
+      setOpenCodeAccounts(bundle.accounts);
+      setOpenCodePool(bundle.pool);
       showToast("OpenCode Go 账号已移除");
     } catch (error) {
       showToast((error as Error).message);
@@ -727,6 +757,7 @@ function App() {
       setRecharges([]);
       setSettings(null);
       setOpenCodeAccounts([]);
+      setOpenCodePool(null);
       setOpenCodeAlerts(null);
       setOpenCodeLoaded(false);
       setActiveView("balance");
@@ -1034,6 +1065,7 @@ function App() {
         ) : (
           <OpenCodeWorkspace
             accounts={openCodeAccounts}
+            pool={openCodePool}
             alerts={openCodeAlerts}
             syncing={syncing}
             loadError={openCodeLoadError}
