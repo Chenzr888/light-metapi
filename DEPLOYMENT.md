@@ -100,7 +100,7 @@ scripts/deploy-cy16.sh \
 专用远端脚本由 `nohup + setsid` 脱离 SSH 会话运行，并用 PID、日志和原子状态文件供本地轮询；断网或关闭终端不会终止远端发布。脚本固定主机名、生产目录、容器名、监听地址和公网地址，然后顺序执行：
 
 1. 每次发布先用 128-bit 随机 nonce 原子创建 `releases/<SHA>/<attempt-id>` 独立暂存目录，再由 `flock` 获取部署锁；两个员工同时操作时不会覆盖脚本、镜像或导入文件，未获得锁的一方在切换前退出。
-2. 下载该 SHA 的成功 CI run 所保存的已测试镜像，传到 CY16 后复核 SHA256、载入镜像并核对 OCI revision label；CY16 不需要保存 GitHub 凭据。
+2. 通过 GitHub API 获取该 SHA 成功 CI run 的唯一 artifact ID，以 16 路分段下载所保存的已测试镜像；下载后核对 API 声明大小，传到 CY16 后复核 SHA256、载入镜像并核对 OCI revision label。临时签名 URL 不写日志，CY16 不需要保存 GitHub 凭据。
 3. 给旧镜像增加不可变回滚 tag。
 4. 用 SQLite online backup API 备份数据库，合并 WAL、切换为单文件 DELETE journal，并对独立快照执行 `integrity_check`；同时备份加密密钥和 Session 密钥。
 5. 在生产备份副本上启动 `127.0.0.1:18756` 候选容器。候选关闭定时刷新和通知，验证数据库迁移、用户数、渠道数、OpenCode 账号数、鉴权和容器硬化参数。
