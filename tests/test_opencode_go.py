@@ -237,12 +237,36 @@ class OpenCodeGoTest(unittest.TestCase):
             self.assertEqual(client.get("/api/opencode/accounts").status_code, 401)
             self.assertEqual(client.get("/_ub_api/opencode/accounts").status_code, 401)
 
+    def test_source_note_defaults_to_blank_for_existing_style_rows(self):
+        marker = uuid.uuid4().hex
+        account_key = f"source-default-{marker}"
+        ts = app.now_iso()
+        try:
+            with app.db() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO opencode_accounts(account_key, label, created_at, updated_at)
+                    VALUES(?, ?, ?, ?)
+                    """,
+                    (account_key, "Source default test", ts, ts),
+                )
+                row = conn.execute(
+                    "SELECT * FROM opencode_accounts WHERE id = ?",
+                    (cur.lastrowid,),
+                ).fetchone()
+            self.assertEqual(row["source_note"], "")
+            self.assertEqual(app.public_opencode_account(dict(row))["source_note"], "")
+        finally:
+            with app.db() as conn:
+                conn.execute("DELETE FROM opencode_accounts WHERE account_key = ?", (account_key,))
+
     def test_account_secrets_are_encrypted_and_masked(self):
         marker = uuid.uuid4().hex
         username = f"opencode-test-user-{marker}"
         label = f"OpenCode {marker}"
         auth_cookie = f"auth-cookie-{marker}"
         api_key = f"sk-{marker}"
+        source_note = f"7.29-{marker[:8]}"
         ts = app.now_iso()
         with app.db() as conn:
             cur = conn.execute(
@@ -260,6 +284,7 @@ class OpenCodeGoTest(unittest.TestCase):
                     sess["totp_enabled"] = False
                 response = client.post("/api/opencode/accounts", json={
                     "label": label,
+                    "source_note": source_note,
                     "workspace_id": "wrk_TEST123",
                     "auth_cookie": auth_cookie,
                     "api_key": api_key,
@@ -272,14 +297,19 @@ class OpenCodeGoTest(unittest.TestCase):
             self.assertNotIn(api_key, serialized)
             self.assertTrue(payload["has_auth_cookie"])
             self.assertTrue(payload["has_api_key"])
+            self.assertEqual(payload["source_note"], source_note)
+
+            updated = app.save_opencode_account({"label": f"{label} updated"}, account_id)
+            self.assertEqual(updated["source_note"], source_note)
 
             with app.db() as conn:
                 row = conn.execute(
-                    "SELECT auth_cookie_enc, api_key_enc FROM opencode_accounts WHERE id = ?",
+                    "SELECT source_note, auth_cookie_enc, api_key_enc FROM opencode_accounts WHERE id = ?",
                     (account_id,),
                 ).fetchone()
             self.assertNotIn(auth_cookie, row["auth_cookie_enc"])
             self.assertNotIn(api_key, row["api_key_enc"])
+            self.assertEqual(row["source_note"], source_note)
             self.assertEqual(app.decrypt(row["auth_cookie_enc"]), auth_cookie)
             self.assertEqual(app.decrypt(row["api_key_enc"]), api_key)
         finally:

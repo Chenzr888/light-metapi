@@ -85,6 +85,7 @@ interface RawOpenCodeAccount {
   id: number;
   account_key: string;
   label: string;
+  source_note?: string;
   workspace_id: string | null;
   quota_configured: boolean;
   models_configured: boolean;
@@ -290,6 +291,7 @@ function mapOpenCodeAccount(raw: RawOpenCodeAccount): OpenCodeAccount {
     id: raw.id,
     accountKey: raw.account_key,
     label: raw.label,
+    sourceNote: raw.source_note || "",
     workspaceId: raw.workspace_id,
     quotaConfigured: raw.quota_configured,
     modelsConfigured: raw.models_configured,
@@ -435,6 +437,7 @@ export async function saveOpenCodeAccount(draft: OpenCodeDraft, accountId?: numb
     method: accountId ? "PUT" : "POST",
     body: JSON.stringify({
       label: draft.label,
+      source_note: draft.sourceNote,
       workspace_id: draft.workspaceId,
       auth_cookie: draft.authCookie,
       api_key: draft.apiKey,
