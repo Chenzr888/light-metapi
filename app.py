@@ -59,6 +59,7 @@ LOW_BALANCE_EMAIL_SMTP_PORT = int(os.getenv("LOW_BALANCE_EMAIL_SMTP_PORT", "2587
 LOW_BALANCE_EMAIL_SMTP_USER = os.getenv("LOW_BALANCE_EMAIL_SMTP_USER", "resend")
 LOW_BALANCE_EMAIL_SMTP_TOKEN = os.getenv("LOW_BALANCE_EMAIL_SMTP_TOKEN", "")
 OPENCODE_GO_ORIGIN = os.getenv("OPENCODE_GO_ORIGIN", "https://opencode.ai").rstrip("/")
+OPENCODE_GO_ALERT_ENABLED = os.getenv("OPENCODE_GO_ALERT_ENABLED", "1") == "1"
 OPENCODE_GO_ALERT_INTERVAL_SECONDS = max(30, int(os.getenv("OPENCODE_GO_ALERT_INTERVAL_SECONDS", "60")))
 OPENCODE_GO_ALERT_THRESHOLDS = parse_alert_thresholds(os.getenv("OPENCODE_GO_ALERT_THRESHOLDS", "20,5,0"))
 OPENCODE_GO_POOL_ALERT_USD = parse_pool_alert_usd(
@@ -71,6 +72,7 @@ OPENCODE_GO_REFRESH_WORKERS = max(4, int(os.getenv("OPENCODE_GO_REFRESH_WORKERS"
 OPENCODE_GO_IMPORT_FILE = Path(
     os.getenv("OPENCODE_GO_IMPORT_FILE", str(DATA_DIR / "opencode-import.json"))
 )
+OPENCODE_SOURCE_NOTE_MAX_LENGTH = 80
 
 
 def read_or_create_secret(path, size=32):
@@ -303,6 +305,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_key TEXT NOT NULL UNIQUE,
                 label TEXT NOT NULL,
+                source_note TEXT NOT NULL DEFAULT '',
                 workspace_id TEXT NOT NULL DEFAULT '',
                 auth_cookie_enc TEXT NOT NULL DEFAULT '',
                 api_key_enc TEXT NOT NULL DEFAULT '',
@@ -312,6 +315,7 @@ def init_db():
             )
             """
         )
+        ensure_column(conn, "opencode_accounts", "source_note", "TEXT NOT NULL DEFAULT ''")
 
 
 def ensure_column(conn, table, column, column_type):
@@ -375,6 +379,13 @@ def validate_opencode_workspace_id(value):
     return workspace_id
 
 
+def validate_opencode_source_note(value):
+    source_note = str(value or "").strip()
+    if len(source_note) > OPENCODE_SOURCE_NOTE_MAX_LENGTH:
+        raise ValueError(f"来源备注不能超过 {OPENCODE_SOURCE_NOTE_MAX_LENGTH} 个字符")
+    return source_note
+
+
 def normalize_opencode_account_key(value, fallback="account"):
     account_key = re.sub(r"[^a-z0-9_-]+", "-", str(value or "").strip().lower()).strip("-_")
     account_key = (account_key or fallback)[:40]
@@ -417,6 +428,7 @@ def public_opencode_account(row):
         "id": row["id"],
         "account_key": row["account_key"],
         "label": row["label"],
+        "source_note": str(row.get("source_note") or ""),
         "workspace_id": workspace_id or None,
         "quota_configured": bool(workspace_id and has_auth_cookie),
         "models_configured": has_api_key,
@@ -572,6 +584,9 @@ def save_opencode_account(payload, account_id=None):
     label = str(payload.get("label") or (current or {}).get("label") or "").strip()
     if not label:
         raise ValueError("账号名称不能为空")
+    source_note = validate_opencode_source_note(
+        payload.get("source_note", (current or {}).get("source_note", ""))
+    )
     if payload.get("clear_workspace_id"):
         workspace_id = ""
     else:
@@ -594,10 +609,10 @@ def save_opencode_account(payload, account_id=None):
             conn.execute(
                 """
                 UPDATE opencode_accounts
-                SET label = ?, workspace_id = ?, auth_cookie_enc = ?, api_key_enc = ?, enabled = ?, updated_at = ?
+                SET label = ?, source_note = ?, workspace_id = ?, auth_cookie_enc = ?, api_key_enc = ?, enabled = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (label, workspace_id, encrypt(auth_cookie), encrypt(api_key), enabled, ts, account_id),
+                (label, source_note, workspace_id, encrypt(auth_cookie), encrypt(api_key), enabled, ts, account_id),
             )
             saved_id = account_id
         else:
@@ -606,11 +621,11 @@ def save_opencode_account(payload, account_id=None):
             cur = conn.execute(
                 """
                 INSERT INTO opencode_accounts(
-                    account_key, label, workspace_id, auth_cookie_enc, api_key_enc,
+                    account_key, label, source_note, workspace_id, auth_cookie_enc, api_key_enc,
                     enabled, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (account_key, label, workspace_id, encrypt(auth_cookie), encrypt(api_key), enabled, ts, ts),
+                (account_key, label, source_note, workspace_id, encrypt(auth_cookie), encrypt(api_key), enabled, ts, ts),
             )
             saved_id = cur.lastrowid
     clear_opencode_cache(saved_id)
@@ -636,8 +651,11 @@ def import_opencode_accounts(path=OPENCODE_GO_IMPORT_FILE):
             if not workspace_id and not auth_cookie and not api_key:
                 continue
             label = str(account.get("label") or f"账号 {index + 1}").strip() or f"账号 {index + 1}"
+            source_note = validate_opencode_source_note(
+                account.get("sourceNote", account.get("source_note", ""))
+            )
             account_key = normalize_opencode_account_key(account.get("id"), f"account-{index + 1}")
-            prepared.append((account_key, label, workspace_id, auth_cookie, api_key))
+            prepared.append((account_key, label, source_note, workspace_id, auth_cookie, api_key))
 
         with db() as conn:
             existing = conn.execute("SELECT COUNT(*) FROM opencode_accounts").fetchone()[0]
@@ -646,18 +664,19 @@ def import_opencode_accounts(path=OPENCODE_GO_IMPORT_FILE):
             else:
                 imported = 0
                 ts = now_iso()
-                for account_key, label, workspace_id, auth_cookie, api_key in prepared:
+                for account_key, label, source_note, workspace_id, auth_cookie, api_key in prepared:
                     account_key = unique_opencode_account_key(conn, account_key)
                     conn.execute(
                         """
                         INSERT INTO opencode_accounts(
-                            account_key, label, workspace_id, auth_cookie_enc, api_key_enc,
+                            account_key, label, source_note, workspace_id, auth_cookie_enc, api_key_enc,
                             enabled, created_at, updated_at
-                        ) VALUES(?, ?, ?, ?, ?, 1, ?, ?)
+                        ) VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?)
                         """,
                         (
                             account_key,
                             label,
+                            source_note,
                             workspace_id,
                             encrypt(auth_cookie),
                             encrypt(api_key),
@@ -675,7 +694,9 @@ def import_opencode_accounts(path=OPENCODE_GO_IMPORT_FILE):
 
 
 def opencode_notifications_enabled():
-    return notification_webhooks_configured() or low_balance_email_configured()
+    return OPENCODE_GO_ALERT_ENABLED and (
+        notification_webhooks_configured() or low_balance_email_configured()
+    )
 
 
 def public_opencode_alert_status():
@@ -699,7 +720,7 @@ def run_opencode_alert_monitor(force=False):
         opencode_alert_status["running"] = True
         opencode_alert_status["enabled"] = opencode_notifications_enabled()
         opencode_alert_status["last_run_at"] = now_iso()
-        if not opencode_alert_status["enabled"] and not force:
+        if not opencode_alert_status["enabled"]:
             return dict(opencode_alert_status)
         accounts = load_opencode_accounts(force=False)
         try:

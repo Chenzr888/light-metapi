@@ -719,7 +719,7 @@ h2 {
 
 .opencode-row-grid {
   display: grid;
-  grid-template-columns: minmax(220px, 1.35fr) 92px minmax(430px, 2.2fr) 96px 94px 88px;
+  grid-template-columns: minmax(220px, 1.35fr) 112px minmax(430px, 2.2fr) 96px 94px 88px;
   align-items: center;
   gap: 12px;
 }
@@ -794,7 +794,7 @@ h2 {
 }
 
 .opencode-account-identity > div,
-.opencode-provider,
+.opencode-source,
 .opencode-models,
 .opencode-health {
   min-width: 0;
@@ -802,8 +802,8 @@ h2 {
 
 .opencode-account-identity strong,
 .opencode-account-identity span,
-.opencode-provider strong,
-.opencode-provider span,
+.opencode-source strong,
+.opencode-source span,
 .opencode-models strong,
 .opencode-models span,
 .opencode-health small {
@@ -818,7 +818,7 @@ h2 {
 }
 
 .opencode-account-identity > div > span,
-.opencode-provider span,
+.opencode-source span,
 .opencode-models span,
 .opencode-health small {
   margin-top: 4px;
@@ -829,8 +829,11 @@ h2 {
   white-space: nowrap;
 }
 
-.opencode-provider strong,
+.opencode-source strong,
 .opencode-models strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 12px;
 }
 
@@ -1308,8 +1311,9 @@ h2 {
     grid-row: 1;
   }
 
-  .opencode-provider {
-    display: none;
+  .opencode-source {
+    grid-column: 1 / -1;
+    grid-row: 3;
   }
 
   .opencode-quota-columns {
@@ -1343,12 +1347,12 @@ h2 {
 
   .opencode-models {
     grid-column: 1;
-    grid-row: 3;
+    grid-row: 4;
   }
 
   .opencode-health {
     grid-column: 2;
-    grid-row: 3;
+    grid-row: 4;
     justify-items: end;
   }
 

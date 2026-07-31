@@ -95,6 +95,7 @@ const emptyAuth: AuthState = {
 
 const emptyOpenCodeDraft: OpenCodeDraft = {
   label: "",
+  sourceNote: "",
   workspaceId: "",
   authCookie: "",
   apiKey: "",
@@ -261,7 +262,7 @@ function OpenCodeWorkspace({
   const poolAlerts = alerts?.poolThresholdsUsd || { rolling: 20, weekly: 80, monthly: 300 };
   const visibleAccounts = useMemo(() => accounts
     .filter((account) => {
-      const haystack = `${account.label} ${account.accountKey} ${account.workspaceId || ""}`.toLowerCase();
+      const haystack = `${account.label} ${account.sourceNote} ${account.accountKey} ${account.workspaceId || ""}`.toLowerCase();
       const matchesQuery = haystack.includes(query.trim().toLowerCase());
       const needsAttention = openCodeNeedsAttention(account);
       const matchesFilter = filter === "all"
@@ -303,7 +304,7 @@ function OpenCodeWorkspace({
               <input
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder="搜索账号、Workspace"
+                placeholder="搜索账号、来源、Workspace"
                 aria-label="搜索 OpenCode Go 账号"
               />
             </label>
@@ -347,7 +348,7 @@ function OpenCodeWorkspace({
             <div className="opencode-table" role="table" aria-label="OpenCode Go 账号额度">
               <div className="opencode-row-grid opencode-table-header" role="row">
                 <span role="columnheader">账号 / Workspace</span>
-                <span role="columnheader">分组</span>
+                <span role="columnheader">来源</span>
                 <div className="opencode-quota-columns opencode-quota-head" role="columnheader">
                   <span>5H</span><span>周</span><span>月</span>
                 </div>
@@ -379,7 +380,10 @@ function OpenCodeWorkspace({
                         <span title={account.workspaceId || account.accountKey}>{account.workspaceId || account.accountKey}</span>
                       </div>
                     </div>
-                    <div className="opencode-provider" role="cell"><strong>OpenCode</strong><span>Go</span></div>
+                    <div className="opencode-source" role="cell">
+                      <strong title={account.sourceNote || "未备注来源"}>{account.sourceNote || "—"}</strong>
+                      <span>{account.sourceNote ? "来源" : "未备注"}</span>
+                    </div>
                     <div className="opencode-quota-columns" role="cell">
                       {openCodeWindowKeys.map((key) => (
                         <OpenCodeQuotaCell key={key} quota={account.quota?.windows[key]} label={openCodeWindowLabels[key]} />
@@ -588,6 +592,7 @@ function App() {
     setOpenCodeEditorId(account?.id ?? null);
     setOpenCodeDraft({
       label: account?.label || "",
+      sourceNote: account?.sourceNote || "",
       workspaceId: account?.workspaceId || "",
       authCookie: "",
       apiKey: "",
@@ -1167,6 +1172,7 @@ function App() {
             </div>
             <form className="drawer-form" onSubmit={handleSaveOpenCode}>
               <label>账号名称<input value={openCodeDraft.label} onChange={(event) => setOpenCodeDraft({ ...openCodeDraft, label: event.target.value })} required placeholder="例如 OpenCode Go 主账号" /></label>
+              <label>来源备注<input value={openCodeDraft.sourceNote} onChange={(event) => setOpenCodeDraft({ ...openCodeDraft, sourceNote: event.target.value })} maxLength={80} placeholder="例如 7.29 四号" /></label>
               <label>Workspace ID<input value={openCodeDraft.workspaceId} onChange={(event) => setOpenCodeDraft({ ...openCodeDraft, workspaceId: event.target.value })} placeholder="wrk_..." /></label>
               <label>auth Cookie<input value={openCodeDraft.authCookie} onChange={(event) => setOpenCodeDraft({ ...openCodeDraft, authCookie: event.target.value })} type="password" placeholder={openCodeEditorId ? "留空保持现有 Cookie" : "auth=..."} autoComplete="off" /></label>
               <label>API Key<input value={openCodeDraft.apiKey} onChange={(event) => setOpenCodeDraft({ ...openCodeDraft, apiKey: event.target.value })} type="password" placeholder={openCodeEditorId ? "留空保持现有 Key" : "sk-..."} autoComplete="off" /></label>

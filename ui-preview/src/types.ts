@@ -97,6 +97,7 @@ export interface OpenCodeAccount {
   id: number;
   accountKey: string;
   label: string;
+  sourceNote: string;
   workspaceId: string | null;
   quotaConfigured: boolean;
   modelsConfigured: boolean;
@@ -139,6 +140,7 @@ export interface OpenCodeAlertStatus {
 
 export interface OpenCodeDraft {
   label: string;
+  sourceNote: string;
   workspaceId: string;
   authCookie: string;
   apiKey: string;
