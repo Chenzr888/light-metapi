@@ -95,6 +95,7 @@ docker compose up -d --build
 | `LOW_BALANCE_ALERT_COOLDOWN_SECONDS` | `21600` | 单渠道告警冷却时间 |
 | `UPSTREAM_REQUEST_TIMEOUT` | `25` | 上游请求超时时间 |
 | `OPENCODE_GO_ALERT_INTERVAL_SECONDS` | `60` | OpenCode Go 告警检查间隔 |
+| `OPENCODE_GO_ALERT_ENABLED` | `1` | 设为 `0` 时仅关闭 OpenCode Go 通知，保留共享通知通道 |
 | `OPENCODE_GO_ALERT_THRESHOLDS` | `20,5,0` | 兼容保留的单账号剩余百分比告警线（默认关闭） |
 | `OPENCODE_GO_POOL_ALERT_USD` | `rolling=20,weekly=80,monthly=300` | OpenCode Go 池剩余美元告警线 |
 | `OPENCODE_GO_REFRESH_DEADLINE_SECONDS` | `90` | 一次多账号刷新整体等待上限，超时后返回部分结果 |

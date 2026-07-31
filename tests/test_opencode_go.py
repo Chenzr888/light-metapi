@@ -19,6 +19,17 @@ from opencode_go import (
 
 
 class OpenCodeGoTest(unittest.TestCase):
+    def test_disabled_alert_monitor_skips_even_when_forced(self):
+        with (
+            patch.object(app, "OPENCODE_GO_ALERT_ENABLED", False),
+            patch.object(app, "notification_webhooks_configured", return_value=True),
+            patch.object(app, "load_opencode_accounts") as load_accounts,
+        ):
+            status = app.run_opencode_alert_monitor(force=True)
+
+        self.assertFalse(status["enabled"])
+        load_accounts.assert_not_called()
+
     def test_concurrent_refresh_is_rejected_without_occupying_another_request(self):
         started = Event()
         release = Event()

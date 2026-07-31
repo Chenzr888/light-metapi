@@ -86,6 +86,7 @@ Local recharge storage keeps amount, status, type, time, and a hashed source ref
 | `LOW_BALANCE_ALERT_COOLDOWN_SECONDS` | `21600` | Alert cooldown per channel |
 | `UPSTREAM_REQUEST_TIMEOUT` | `25` | Upstream request timeout |
 | `OPENCODE_GO_ALERT_INTERVAL_SECONDS` | `60` | OpenCode Go alert check interval |
+| `OPENCODE_GO_ALERT_ENABLED` | `1` | Set to `0` to disable only OpenCode Go notifications while keeping shared notification channels active |
 | `OPENCODE_GO_ALERT_THRESHOLDS` | `20,5,0` | Legacy per-account remaining-percent levels (off by default) |
 | `OPENCODE_GO_POOL_ALERT_USD` | `rolling=20,weekly=80,monthly=300` | OpenCode Go pooled remaining-USD alert lines |
 | `OPENCODE_GO_REFRESH_DEADLINE_SECONDS` | `90` | Overall multi-account refresh deadline before returning partial results |

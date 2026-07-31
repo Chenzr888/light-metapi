@@ -59,6 +59,7 @@ LOW_BALANCE_EMAIL_SMTP_PORT = int(os.getenv("LOW_BALANCE_EMAIL_SMTP_PORT", "2587
 LOW_BALANCE_EMAIL_SMTP_USER = os.getenv("LOW_BALANCE_EMAIL_SMTP_USER", "resend")
 LOW_BALANCE_EMAIL_SMTP_TOKEN = os.getenv("LOW_BALANCE_EMAIL_SMTP_TOKEN", "")
 OPENCODE_GO_ORIGIN = os.getenv("OPENCODE_GO_ORIGIN", "https://opencode.ai").rstrip("/")
+OPENCODE_GO_ALERT_ENABLED = os.getenv("OPENCODE_GO_ALERT_ENABLED", "1") == "1"
 OPENCODE_GO_ALERT_INTERVAL_SECONDS = max(30, int(os.getenv("OPENCODE_GO_ALERT_INTERVAL_SECONDS", "60")))
 OPENCODE_GO_ALERT_THRESHOLDS = parse_alert_thresholds(os.getenv("OPENCODE_GO_ALERT_THRESHOLDS", "20,5,0"))
 OPENCODE_GO_POOL_ALERT_USD = parse_pool_alert_usd(
@@ -693,7 +694,9 @@ def import_opencode_accounts(path=OPENCODE_GO_IMPORT_FILE):
 
 
 def opencode_notifications_enabled():
-    return notification_webhooks_configured() or low_balance_email_configured()
+    return OPENCODE_GO_ALERT_ENABLED and (
+        notification_webhooks_configured() or low_balance_email_configured()
+    )
 
 
 def public_opencode_alert_status():
@@ -717,7 +720,7 @@ def run_opencode_alert_monitor(force=False):
         opencode_alert_status["running"] = True
         opencode_alert_status["enabled"] = opencode_notifications_enabled()
         opencode_alert_status["last_run_at"] = now_iso()
-        if not opencode_alert_status["enabled"] and not force:
+        if not opencode_alert_status["enabled"]:
             return dict(opencode_alert_status)
         accounts = load_opencode_accounts(force=False)
         try:
