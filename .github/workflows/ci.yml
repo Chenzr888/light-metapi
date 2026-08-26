@@ -129,7 +129,7 @@ jobs:
           done
           curl --fail --silent http://127.0.0.1:18756/api/health >/dev/null
           curl --fail --silent http://127.0.0.1:18756/_ub_api/auth/bootstrap >/dev/null
-          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:18756/_ub_api/opencode/accounts)" = "401"
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:18756/_ub_api/channels)" = "401"
 
       - name: Export the tested image
         if: github.event_name == 'push'
