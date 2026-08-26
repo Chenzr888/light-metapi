@@ -62,6 +62,7 @@ export interface DraftChannel {
   baseUrl: string;
   username: string;
   password: string;
+  accessToken?: string;
   totp: string;
   cnyRate: string;
   thresholdCny: string;

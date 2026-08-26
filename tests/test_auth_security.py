@@ -11,7 +11,7 @@ class AuthSecurityTest(unittest.TestCase):
         self.conn.row_factory = sqlite3.Row
         auth_security.ensure_schema(self.conn)
         self.now = datetime(2026, 8, 25, 10, 0, tzinfo=timezone.utc)
-        self.key = auth_security.attempt_key("chenyan", "127.0.0.1")
+        self.key = auth_security.attempt_key("test-admin", "127.0.0.1")
 
     def tearDown(self):
         self.conn.close()

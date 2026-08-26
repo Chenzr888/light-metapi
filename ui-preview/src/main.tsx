@@ -95,6 +95,7 @@ function App() {
   const [editing, setEditing] = useState<Channel | null>(null);
   const [draft, setDraft] = useState<DraftChannel>(emptyDraft);
   const [toast, setToast] = useState("");
+  const [activeTab, setActiveTab] = useState("余额");
 
   const summary = useMemo(() => ({
     totalUsd: channels.filter((item) => item.status === "ok").reduce((sum, item) => sum + (item.balanceUsd || 0), 0),
@@ -367,6 +368,9 @@ function App() {
         <div className="brand-row"><span className="brand-mark"><Server size={19} /></span><div><strong>渠道余额</strong><span>SandboxAI</span></div></div>
         <div className="header-actions"><span className="user-name"><UserRound size={15} />{auth.username}</span><button className="icon-button" type="button" title="退出登录" onClick={handleLogout}><LogOut size={17} /></button></div>
       </header>
+      <nav className="tabs" aria-label="主导航">{["余额", "渠道", "统计", "测活", "服务器"].map((tab) => <button key={tab} className={activeTab === tab ? "selected" : ""} onClick={() => setActiveTab(tab)}>{tab}</button>)}</nav>
+      {activeTab !== "余额" && <section className="empty-state"><h2>{activeTab}</h2><p>规划中</p></section>}
+      {activeTab === "余额" && <>
 
       <main className="content">
         <section className="page-head">
@@ -440,8 +444,9 @@ function App() {
               <label>渠道名<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required /></label>
               {!editing && <>
                 <label>上游地址<input value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} placeholder="https://" required /></label>
-                <label>登录账号<input value={draft.username} onChange={(event) => setDraft({ ...draft, username: event.target.value })} autoComplete="username" required /></label>
-                <label>登录密码<input value={draft.password} onChange={(event) => setDraft({ ...draft, password: event.target.value })} type="password" autoComplete="new-password" required /></label>
+                <label>登录账号<input value={draft.username} onChange={(event) => setDraft({ ...draft, username: event.target.value })} autoComplete="username" placeholder="可留空，改用 token" /></label>
+                <label>登录密码<input value={draft.password} onChange={(event) => setDraft({ ...draft, password: event.target.value })} type="password" autoComplete="new-password" placeholder="可留空，改用 token" /></label>
+                <label>访问 token（人工兜底）<input value={draft.accessToken || ""} onChange={(event) => setDraft({ ...draft, accessToken: event.target.value })} type="password" autoComplete="off" placeholder="粘贴后将跳过账号密码登录" /></label>
                 {draft.platform === "new_api" && <label>2FA 验证码<input value={draft.totp} onChange={(event) => setDraft({ ...draft, totp: event.target.value })} inputMode="numeric" placeholder="未开启可留空" /></label>}
               </>}
               <div className="balance-form-grid">
@@ -461,10 +466,10 @@ function App() {
             <div className="drawer-head"><div><span>最新小时备份</span><h2>同步渠道账号</h2></div><button className="icon-button" type="button" title="关闭" onClick={() => setSyncOpen(false)}><X size={18} /></button></div>
             <form className="drawer-form" onSubmit={handleSyncAccounts}>
               <div className="form-section-title">New API</div>
-              <label>登录账号<input name="new_api_username" defaultValue="chenyan" autoComplete="username" required /></label>
+              <label>登录账号<input name="new_api_username" placeholder="请输入 New API 账号" autoComplete="username" required /></label>
               <label>登录密码<input name="new_api_password" type="password" autoComplete="new-password" required /></label>
               <div className="form-section-title">Sub2API</div>
-              <label>登录邮箱<input name="sub2api_username" defaultValue="cheny2812@qq.com" autoComplete="username" required /></label>
+              <label>登录邮箱<input name="sub2api_username" placeholder="请输入 Sub2API 邮箱" autoComplete="username" required /></label>
               <label>登录密码<input name="sub2api_password" type="password" autoComplete="new-password" required /></label>
               <button className="primary-button full" type="submit" disabled={busy}>{busy ? "正在识别并登录" : "开始同步"}</button>
             </form>
@@ -487,6 +492,7 @@ function App() {
         </div>
       )}
       <div className={`toast ${toast ? "show" : ""}`}>{toast}</div>
+      </>}
     </div>
   );
 }

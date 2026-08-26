@@ -284,6 +284,7 @@ export async function createChannel(draft: DraftChannel) {
     base_url: draft.baseUrl,
     username: draft.username,
     password: draft.password,
+    access_token: draft.accessToken || "",
     totp: draft.totp,
     cny_rate: draft.cnyRate,
     alert_cny: draft.thresholdCny,

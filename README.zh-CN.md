@@ -52,7 +52,7 @@ docker compose up -d --build
 
 ## 小时备份
 
-`/home/cy/ai/api/scripts/backup-cy16.sh` 在完成小时备份时，会额外导出一份不含密钥的渠道清单，并默认同步到：
+备份脚本在完成小时备份时，会额外导出一份不含密钥的渠道清单，并默认同步到应用数据目录：
 
 ```text
 data/channel-catalog.json

@@ -49,6 +49,7 @@ ACCOUNT_REFRESH_ENABLED = os.getenv(
 NOTIFY_INTERVAL_SECONDS = int(os.getenv("NOTIFY_INTERVAL_SECONDS", "3600"))
 REQUEST_TIMEOUT = int(os.getenv("UPSTREAM_REQUEST_TIMEOUT", "25"))
 HISTORY_RETENTION_HOURS = int(os.getenv("HISTORY_RETENTION_HOURS", "72"))
+HOURLY_HISTORY_RETENTION_DAYS = int(os.getenv("HOURLY_HISTORY_RETENTION_DAYS", "180"))
 DEFAULT_CNY_RATE = Decimal(os.getenv("DEFAULT_CNY_RATE", "7.3"))
 RECHARGE_ROUNDING_UNIT = Decimal(os.getenv("RECHARGE_ROUNDING_UNIT", "100"))
 LOW_BALANCE_ALERT_CNY = Decimal(os.getenv("LOW_BALANCE_ALERT_CNY", "100"))
@@ -174,6 +175,8 @@ def init_db():
         ensure_column(conn, "channels", "cny_rate", "REAL")
         ensure_column(conn, "channels", "alert_cny", "REAL")
         ensure_column(conn, "channels", "boss_recharge_required", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "channels", "refresh_failures", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "channels", "next_refresh_at", "TEXT")
         conn.execute(
             """
             UPDATE channels
@@ -212,6 +215,22 @@ def init_db():
             ON balance_history(channel_id, checked_at)
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS balance_history_hourly (
+                channel_id INTEGER NOT NULL,
+                hour TEXT NOT NULL,
+                balance REAL,
+                used_balance REAL,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                sample_count INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(channel_id, hour),
+                FOREIGN KEY(channel_id) REFERENCES channels(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_balance_history_hourly_time ON balance_history_hourly(hour)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS recharge_logs (
@@ -850,6 +869,7 @@ def record_balance_history(conn, channel_id, result, checked_at):
             checked_at,
         ),
     )
+    aggregate_hourly_history(conn, channel_id, result, checked_at)
 
 
 def record_failure_history(conn, channel_id, row, error, checked_at):
@@ -867,6 +887,29 @@ def record_failure_history(conn, channel_id, row, error, checked_at):
             checked_at,
             checked_at,
         ),
+    )
+    aggregate_hourly_history(conn, channel_id, {
+        "balance": row["balance"] if row else None,
+        "used_balance": row["used_balance"] if row else None,
+        "status": "error",
+    }, checked_at)
+
+
+def aggregate_hourly_history(conn, channel_id, result, checked_at):
+    """Upsert one durable hourly sample while retaining the raw 72h stream."""
+    try:
+        hour = datetime.fromisoformat(checked_at).astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+    except ValueError:
+        hour = checked_at[:13] + ":00:00+00:00"
+    conn.execute(
+        """
+        INSERT INTO balance_history_hourly(channel_id, hour, balance, used_balance, status, sample_count, created_at)
+        VALUES(?, ?, ?, ?, ?, 1, ?)
+        ON CONFLICT(channel_id, hour) DO UPDATE SET
+            balance=excluded.balance, used_balance=excluded.used_balance,
+            status=excluded.status, sample_count=balance_history_hourly.sample_count + 1
+        """,
+        (channel_id, as_float(result.get("balance")), as_float(result.get("used_balance")), result.get("status", "unknown"), checked_at),
     )
 
 
@@ -985,6 +1028,8 @@ def safe_sync_recharge_logs(conn, channel, logs):
 
 def prune_history(conn):
     conn.execute("DELETE FROM balance_history WHERE checked_at < ?", (history_cutoff_iso(),))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=HOURLY_HISTORY_RETENTION_DAYS)).isoformat()
+    conn.execute("DELETE FROM balance_history_hourly WHERE hour < ?", (cutoff,))
 
 
 def row_to_channel(row, include_secret=False):
@@ -1468,7 +1513,7 @@ def fetch_sub2api(channel):
                 result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
                 return result
             except RuntimeError:
-                if not channel_value(channel, "password_enc", ""):
+                if credential.get("manual_token") or not channel_value(channel, "password_enc", ""):
                     raise
 
     password_enc = channel_value(channel, "password_enc", "")
@@ -1752,7 +1797,7 @@ def fetch_new_api(channel):
             return result
         except RuntimeError as exc:
             message = str(exc).lower()
-            if not password_enc or not any(marker in message for marker in (
+            if credential.get("manual_token") or not password_enc or not any(marker in message for marker in (
                 "unauthorized", "not logged in", "invalid access token", "登录",
             )):
                 raise
@@ -1781,6 +1826,22 @@ def provision_channel(platform, base_url, username, password, totp_code=""):
         result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
         return credential, result
     raise RuntimeError(f"未知平台: {platform}")
+
+
+def provision_channel_token(platform, base_url, token):
+    token = str(token or "").strip()
+    if not token:
+        raise RuntimeError("访问 token 不能为空")
+    credential = {"kind": f"{platform}_token", "access_token": token, "manual_token": True, "issued_at": now_iso()}
+    if platform == "new_api":
+        result = build_new_api_result(base_url, new_api_self(base_url, credential))
+        result["recharge_logs"] = safe_new_api_recharge_logs(base_url, credential)
+    elif platform == "sub2api":
+        result = build_sub2api_result(sub2api_profile(base_url, token))
+        result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, token)
+    else:
+        raise RuntimeError(f"未知平台: {platform}")
+    return credential, result
 
 
 def persist_provisioned_channel(name, platform, base_url, username, password, credential, result,
@@ -1977,7 +2038,9 @@ def persist_result(channel_id, result):
                 message = ?,
                 raw_response = ?,
                 last_checked_at = ?,
-                updated_at = ?
+                updated_at = ?,
+                refresh_failures = 0,
+                next_refresh_at = NULL
             WHERE id = ?
             """,
             (
@@ -2012,7 +2075,10 @@ def persist_failure(channel_id, error):
             SET status = 'error',
                 message = ?,
                 last_checked_at = ?,
-                updated_at = ?
+                updated_at = ?,
+                refresh_failures = COALESCE(refresh_failures, 0) + 1,
+                next_refresh_at = CASE WHEN COALESCE(refresh_failures, 0) + 1 >= 3
+                    THEN datetime('now', '+1 hour') ELSE NULL END
             WHERE id = ?
             """,
             (str(error)[:1000], checked_at, checked_at, channel_id),
@@ -2033,15 +2099,26 @@ def refresh_one(channel_id):
 def refresh_all(send_notify=False):
     with refresh_lock:
         with db() as conn:
-            rows = conn.execute("SELECT * FROM channels WHERE enabled = 1 ORDER BY id").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM channels WHERE enabled = 1 AND (next_refresh_at IS NULL OR julianday(next_refresh_at) <= julianday('now')) ORDER BY id"
+            ).fetchall()
         results = []
-        for row in rows:
+        def refresh_row(row):
             try:
                 refreshed = refresh_one(row["id"])
-                results.append(refreshed)
+                return refreshed
             except Exception as exc:
                 persist_failure(row["id"], exc)
-                results.append(row_to_channel(get_channel(row["id"])))
+                return row_to_channel(get_channel(row["id"]))
+        max_workers = min(8, max(1, len(rows)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(refresh_row, rows))
+        # Include skipped channels in notification/status responses.
+        with db() as conn:
+            skipped = conn.execute(
+                "SELECT * FROM channels WHERE enabled = 1 AND julianday(next_refresh_at) > julianday('now') ORDER BY id"
+            ).fetchall()
+        results.extend(row_to_channel(row) for row in skipped)
         send_low_balance_alerts(results)
         send_channel_error_alerts(results)
         if send_notify and setting_get("notify_enabled", "1") == "1":
@@ -2687,6 +2764,7 @@ def api_create_channel():
         return response_error(str(exc))
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
+    access_token = payload.get("access_token") or payload.get("token") or ""
     totp_code = payload.get("totp") or payload.get("totp_code") or ""
     cny_rate = rate_from(payload.get("cny_rate"))
     alert_cny = alert_threshold_from(payload.get("alert_cny"))
@@ -2695,10 +2773,11 @@ def api_create_channel():
         return response_error("平台只支持 new_api 或 sub2api")
     if not name:
         name = base_url.replace("https://", "").replace("http://", "").strip("/")
-    if not username or not password:
-        return response_error("账号和密码必填")
+    if not access_token and (not username or not password):
+        return response_error("账号密码或访问 token 必填")
     try:
-        credential, result = provision_channel(platform, base_url, username, password, totp_code)
+        credential, result = (provision_channel_token(platform, base_url, access_token)
+                              if access_token else provision_channel(platform, base_url, username, password, totp_code))
     except Exception as exc:
         log_channel_create(platform, base_url, username, f"failed: {exc}")
         return response_error(f"测试失败: {exc}", 502)
@@ -2863,6 +2942,26 @@ def api_update_channel(channel_id):
                     channel_id,
                 ),
             )
+    return jsonify({"ok": True, "data": row_to_channel(get_channel(channel_id))})
+
+
+@app.post("/api/channels/<int:channel_id>/token")
+@login_required
+def api_set_channel_token(channel_id):
+    row = get_channel(channel_id)
+    if not row:
+        return response_error("渠道不存在", 404)
+    payload = request_payload(force=True)
+    try:
+        credential, result = provision_channel_token(row["platform"], row["base_url"], payload.get("access_token") or payload.get("token"))
+    except Exception as exc:
+        return response_error(f"token 验证失败: {exc}", 502)
+    ts = now_iso()
+    with db() as conn:
+        conn.execute("UPDATE channels SET credential_enc=?, password_enc='', status=?, message=?, balance=?, raw_balance=?, used_balance=?, raw_used_balance=?, request_count=?, currency=?, raw_response=?, last_checked_at=?, updated_at=?, refresh_failures=0, next_refresh_at=NULL WHERE id=?",
+                     (encrypt(json.dumps(credential, ensure_ascii=False)), result.get("status", "ok"), result.get("message", ""), as_float(result.get("balance")), result.get("raw_balance"), as_float(result.get("used_balance")), result.get("raw_used_balance"), result.get("request_count"), result.get("currency", "USD"), json.dumps(result.get("raw_response") or {}, ensure_ascii=False), ts, ts, channel_id))
+        record_balance_history(conn, channel_id, result, ts)
+        prune_history(conn)
     return jsonify({"ok": True, "data": row_to_channel(get_channel(channel_id))})
 
 
