@@ -909,7 +909,7 @@ def aggregate_hourly_history(conn, channel_id, result, checked_at):
             balance=excluded.balance, used_balance=excluded.used_balance,
             status=excluded.status, sample_count=balance_history_hourly.sample_count + 1
         """,
-        (channel_id, as_float(result.get("balance")), as_float(result.get("used_balance")), result.get("status", "unknown"), checked_at),
+        (channel_id, hour, as_float(result.get("balance")), as_float(result.get("used_balance")), result.get("status", "unknown"), checked_at),
     )
 
 
