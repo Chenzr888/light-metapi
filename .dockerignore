@@ -2,7 +2,6 @@
 .gitignore
 .env
 /config.json
-opencode-import*.json
 .venv
 __pycache__
 *.pyc

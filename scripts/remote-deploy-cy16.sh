@@ -13,8 +13,6 @@ IMAGE_REF=${IMAGE_REF:?IMAGE_REF is required}
 IMAGE_ARCHIVE=${IMAGE_ARCHIVE:?IMAGE_ARCHIVE is required}
 IMAGE_ARCHIVE_SHA256=${IMAGE_ARCHIVE_SHA256:?IMAGE_ARCHIVE_SHA256 is required}
 RELEASE_DIR=${RELEASE_DIR:?RELEASE_DIR is required}
-IMPORT_FILE=${IMPORT_FILE:-}
-EXPECTED_OPENCODE=${EXPECTED_OPENCODE:-preserve}
 COMPOSE_SOURCE="$RELEASE_DIR/deploy/docker-compose.cy16.yml"
 ROLLBACK_COMPOSE_SOURCE="$RELEASE_DIR/deploy/docker-compose.rollback.yml"
 COMPOSE_POLICY="$RELEASE_DIR/scripts/validate-compose-policy.py"
@@ -34,7 +32,6 @@ FINAL_BACKUP_READY=0
 DEPLOY_SUCCEEDED=0
 ROLLBACK_COMPLETED=0
 IMAGE_ARCHIVE_PATH_SAFE=0
-IMPORT_PATH_SAFE=0
 CURL_COMMON=(--connect-timeout 5 --max-time 20 --fail --silent --show-error)
 
 # Establish cleanup authority from canonical paths before any fallible preflight
@@ -43,9 +40,6 @@ if [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] && \
    [[ "$ATTEMPT_ID" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}$ ]] && \
    [ "$RELEASE_DIR" = "$APP_ROOT/releases/$RELEASE_SHA/$ATTEMPT_ID" ]; then
   [ "$IMAGE_ARCHIVE" = "$RELEASE_DIR/light-metapi-image.tar.gz" ] && IMAGE_ARCHIVE_PATH_SAFE=1
-  if [ -n "$IMPORT_FILE" ] && [ "$IMPORT_FILE" = "$RELEASE_DIR/opencode-import.json" ]; then
-    IMPORT_PATH_SAFE=1
-  fi
 fi
 
 log() {
@@ -56,22 +50,6 @@ audit() {
   printf '%s operator=%s sha=%s image=%s status=%s\n' \
     "$(date -u +%FT%TZ)" "$(id -un)" "$RELEASE_SHA" "$IMAGE_REF" "$1" >> "$AUDIT_LOG" || return 1
   chmod 600 "$AUDIT_LOG" || return 1
-}
-
-secure_delete() {
-  local target=${1:-}
-  [ -n "$target" ] || return 0
-  [ -f "$target" ] || return 0
-  python3 - "$target" <<'PY'
-import os, sys
-path = sys.argv[1]
-size = os.path.getsize(path)
-with open(path, "r+b", buffering=0) as handle:
-    handle.write(b"\0" * size)
-    handle.flush()
-    os.fsync(handle.fileno())
-os.unlink(path)
-PY
 }
 
 secure_remove_tree() {
@@ -106,9 +84,6 @@ PY
 cleanup_sensitive_files() {
   docker rm -f "$CANARY_CONTAINER" >/dev/null 2>&1 || true
   secure_remove_tree "$CANARY_DATA" || true
-  if [ "$IMPORT_PATH_SAFE" = "1" ]; then
-    secure_delete "$IMPORT_FILE" || true
-  fi
   if [ "$IMAGE_ARCHIVE_PATH_SAFE" = "1" ]; then
     find "$IMAGE_ARCHIVE" -maxdepth 0 -type f -delete 2>/dev/null || true
   fi
@@ -211,35 +186,6 @@ validate_inputs() {
     log "FATAL: less than 2 GiB free disk"
     return 1
   }
-  if [ "$EXPECTED_OPENCODE" != "preserve" ] && ! [[ "$EXPECTED_OPENCODE" =~ ^[0-9]+$ ]]; then
-    log "FATAL: invalid expected account count"
-    return 1
-  fi
-  if [ -n "$IMPORT_FILE" ]; then
-    [ "$IMPORT_FILE" = "$RELEASE_DIR/opencode-import.json" ] || {
-      log "FATAL: import file is outside the release directory"
-      return 1
-    }
-    [ -f "$IMPORT_FILE" ] || { log "FATAL: import file is missing"; return 1; }
-    [ "$(stat -c '%a' "$IMPORT_FILE")" = "600" ] || {
-      log "FATAL: import file must have mode 600"
-      return 1
-    }
-    local import_count
-    import_count=$(python3 - "$IMPORT_FILE" <<'PY'
-import json, sys
-payload = json.load(open(sys.argv[1], encoding="utf-8"))
-accounts = payload.get("accounts") if isinstance(payload, dict) else None
-if not isinstance(accounts, list):
-    raise SystemExit("invalid accounts payload")
-print(len(accounts))
-PY
-)
-    [ "$import_count" = "$EXPECTED_OPENCODE" ] || {
-      log "FATAL: expected $EXPECTED_OPENCODE import accounts, found $import_count"
-      return 1
-    }
-  fi
 }
 
 database_counts() {
@@ -250,7 +196,7 @@ db=sqlite3.connect("/app/data/upstreams.sqlite3")
 tables={row[0] for row in db.execute("select name from sqlite_master where type=\"table\"")}
 def count(name):
     return db.execute("select count(*) from "+name).fetchone()[0] if name in tables else 0
-print(f"{count(chr(117)+chr(115)+chr(101)+chr(114)+chr(115))}|{count(chr(99)+chr(104)+chr(97)+chr(110)+chr(110)+chr(101)+chr(108)+chr(115))}|{count(chr(111)+chr(112)+chr(101)+chr(110)+chr(99)+chr(111)+chr(100)+chr(101)+chr(95)+chr(97)+chr(99)+chr(99)+chr(111)+chr(117)+chr(110)+chr(116)+chr(115))}")'
+print(f"{count(chr(117)+chr(115)+chr(101)+chr(114)+chr(115))}|{count(chr(99)+chr(104)+chr(97)+chr(110)+chr(110)+chr(101)+chr(108)+chr(115))}")'
 }
 
 prepare_rollback_image() {
@@ -435,20 +381,16 @@ verify_instance() {
   curl "${CURL_COMMON[@]}" "$base_url/api/health" >/dev/null || return 1
   verify_database "$target" || return 1
 
-  local counts users channels opencode bootstrap protected_code
+  local counts users channels bootstrap protected_code
   counts=$(database_counts "$target") || return 1
-  IFS='|' read -r users channels opencode <<< "$counts"
+  IFS='|' read -r users channels <<< "$counts"
   [ "$users" = "$before_users" ] || { log "users count changed: $before_users -> $users"; return 1; }
   [ "$channels" = "$before_channels" ] || { log "channels count changed: $before_channels -> $channels"; return 1; }
-  [ "$opencode" = "$EXPECTED_OPENCODE" ] || {
-    log "OpenCode account count mismatch: expected=$EXPECTED_OPENCODE actual=$opencode"
-    return 1
-  }
 
   bootstrap=$(curl "${CURL_COMMON[@]}" "$base_url/api/auth/bootstrap") || return 1
   python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); assert p["ok"] is True; assert p["data"]["needs_setup"] is False' <<< "$bootstrap" || return 1
   protected_code=$(curl --connect-timeout 5 --max-time 20 --silent --output /dev/null --write-out '%{http_code}' \
-    "$base_url/api/opencode/accounts") || return 1
+    "$base_url/api/channels") || return 1
   [ "$protected_code" = "401" ] || { log "protected endpoint returned $protected_code"; return 1; }
 }
 
@@ -461,11 +403,6 @@ run_canary() {
   cp "$CANARY_BACKUP_DIR/secret.key" "$CANARY_DATA/secret.key" || return 1
   cp "$CANARY_BACKUP_DIR/session.secret" "$CANARY_DATA/session.secret" || return 1
   chmod 600 "$CANARY_DATA"/* || return 1
-  if [ -n "$IMPORT_FILE" ]; then
-    cp "$IMPORT_FILE" "$CANARY_DATA/opencode-import.json" || return 1
-    chmod 600 "$CANARY_DATA/opencode-import.json" || return 1
-  fi
-
   docker run -d --name "$CANARY_CONTAINER" \
     --user 1000:1000 --init --read-only --cap-drop ALL --security-opt no-new-privileges:true \
     --cpus 1 --memory 512m --memory-reservation 192m --memory-swap 768m --pids-limit 128 \
@@ -473,7 +410,7 @@ run_canary() {
     --env-file "$ENV_FILE" \
     -e HOST=0.0.0.0 -e PORT=8756 -e UPSTREAM_BALANCE_DATA_DIR=/app/data \
     -e REFRESH_INTERVAL_SECONDS=3600 -e NOTIFY_INTERVAL_SECONDS=3600 \
-    -e OPENCODE_GO_ALERT_INTERVAL_SECONDS=3600 -e LOW_BALANCE_EMAIL_ENABLED=0 \
+    -e LOW_BALANCE_EMAIL_ENABLED=0 \
     -e SESSION_COOKIE_NAME=ub_admin_session -e SESSION_COOKIE_PATH=/upstream-balance \
     -p 127.0.0.1:18756:8756 -v "$CANARY_DATA:/app/data" "$IMAGE_REF" >/dev/null || return 1
 
@@ -492,7 +429,6 @@ run_canary() {
   }
 
   verify_instance "$CANARY_CONTAINER" "http://127.0.0.1:18756" "$before_users" "$before_channels" || return 1
-  [ ! -e "$CANARY_DATA/opencode-import.json" ] || { log "canary did not remove plaintext import"; return 1; }
   [ "$(docker inspect "$CANARY_CONTAINER" --format '{{.Config.Image}}')" = "$IMAGE_REF" ] || return 1
   [ "$(docker inspect "$CANARY_CONTAINER" --format '{{.HostConfig.ReadonlyRootfs}}')" = "true" ] || return 1
   [ "$(docker inspect "$CANARY_CONTAINER" --format '{{.HostConfig.PidsLimit}}')" = "128" ] || return 1
@@ -509,7 +445,6 @@ write_release_env() {
     printf 'UPSTREAM_BALANCE_ENV_FILE=%s\n' "$ENV_FILE"
     printf 'UPSTREAM_BALANCE_CONTAINER_NAME=%s\n' "$CONTAINER"
     printf 'UPSTREAM_BALANCE_BIND=%s\n' '127.0.0.1:8756'
-    printf 'OPENCODE_GO_ALERT_INTERVAL_SECONDS=%s\n' '300'
   } > "$RELEASE_ENV" || return 1
   chmod 600 "$RELEASE_ENV" || return 1
 }
@@ -521,7 +456,6 @@ compose_up() {
   UPSTREAM_BALANCE_ENV_FILE="$ENV_FILE" \
   UPSTREAM_BALANCE_CONTAINER_NAME="$CONTAINER" \
   UPSTREAM_BALANCE_BIND="127.0.0.1:8756" \
-  OPENCODE_GO_ALERT_INTERVAL_SECONDS=300 \
     docker compose --project-name upstream-balance \
       -f "$compose_file" up -d --no-build --wait --wait-timeout 90 \
       --no-deps upstream-balance
@@ -568,9 +502,6 @@ os.chown("/data", 1000, 1000)
 for name in ("upstreams.sqlite3", "secret.key", "session.secret"):
     os.chmod("/data/"+name, 0o600)
     os.chown("/data/"+name, 1000, 1000)
-candidate="/data/opencode-import.json"
-if os.path.exists(candidate):
-    os.unlink(candidate)
 ' || return 1
   write_release_env "$ROLLBACK_TAG" || return 1
   restore_compose_state "$BACKUP_DIR" || return 1
@@ -584,7 +515,6 @@ if os.path.exists(candidate):
 verify_release() {
   local before_users=$1 before_channels=$2
   verify_instance "$CONTAINER" "http://127.0.0.1:8756" "$before_users" "$before_channels" || return 1
-  [ ! -e "$DATA_DIR/opencode-import.json" ] || { log "plaintext import file was not removed"; return 1; }
   [ "$(stat -c '%a' "$DATA_DIR")" = "700" ] || { log "data directory mode is not 700"; return 1; }
   [ "$(stat -c '%a' "$DATA_DIR/upstreams.sqlite3")" = "600" ] || { log "database mode is not 600"; return 1; }
   [ "$(stat -c '%u:%g' "$DATA_DIR")" = "1000:1000" ] || { log "data directory owner is not 1000:1000"; return 1; }
@@ -592,41 +522,28 @@ verify_release() {
   [ "$(docker inspect "$CONTAINER" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}')" = "healthy" ] || return 1
   [ "$(docker inspect "$CONTAINER" --format '{{.RestartCount}}')" = "0" ] || return 1
 
-  local page bootstrap protected_code asset asset_body
+  local page bootstrap asset
   page=$(curl "${CURL_COMMON[@]}" "$PUBLIC_URL") || return 1
   bootstrap=$(curl "${CURL_COMMON[@]}" "${PUBLIC_URL}_ub_api/auth/bootstrap") || return 1
   python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); assert p["ok"] is True; assert p["data"]["needs_setup"] is False' <<< "$bootstrap" || return 1
-  protected_code=$(curl --connect-timeout 5 --max-time 20 --silent --output /dev/null --write-out '%{http_code}' \
-    "${PUBLIC_URL}_ub_api/opencode/accounts") || return 1
-  [ "$protected_code" = "401" ] || { log "protected endpoint returned $protected_code"; return 1; }
   asset=$(grep -oE 'assets/index-[A-Za-z0-9_-]+\.js' <<< "$page" | head -n 1) || return 1
   [ -n "$asset" ] || { log "frontend asset was not found"; return 1; }
-  asset_body=$(curl "${CURL_COMMON[@]}" "${PUBLIC_URL}${asset}") || return 1
-  grep -q 'OpenCode Go' <<< "$asset_body" || {
-    log "deployed frontend does not contain OpenCode Go"
-    return 1
-  }
+  curl "${CURL_COMMON[@]}" "${PUBLIC_URL}${asset}" >/dev/null || return 1
 }
 
 verify_rollback() {
   curl "${CURL_COMMON[@]}" http://127.0.0.1:8756/api/health >/dev/null || return 1
   verify_database "$CONTAINER" || return 1
-  local counts bootstrap protected_code page
+  local counts bootstrap page
   counts=$(database_counts "$CONTAINER") || return 1
-  [ "$counts" = "$USERS_BEFORE|$CHANNELS_BEFORE|$OPENCODE_BEFORE" ] || {
-    log "rollback database counts mismatch: expected=$USERS_BEFORE|$CHANNELS_BEFORE|$OPENCODE_BEFORE actual=$counts"
+  [ "$counts" = "$USERS_BEFORE|$CHANNELS_BEFORE" ] || {
+    log "rollback database counts mismatch: expected=$USERS_BEFORE|$CHANNELS_BEFORE actual=$counts"
     return 1
   }
   page=$(curl "${CURL_COMMON[@]}" "$PUBLIC_URL") || return 1
   [ -n "$page" ] || return 1
   bootstrap=$(curl "${CURL_COMMON[@]}" "${PUBLIC_URL}_ub_api/auth/bootstrap") || return 1
   python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); assert p["ok"] is True; assert p["data"]["needs_setup"] is False' <<< "$bootstrap" || return 1
-  protected_code=$(curl --connect-timeout 5 --max-time 20 --silent --output /dev/null --write-out '%{http_code}' \
-    "${PUBLIC_URL}_ub_api/opencode/accounts") || return 1
-  [ "$protected_code" = "401" ] || [ "$protected_code" = "404" ] || {
-    log "rollback protected endpoint returned $protected_code"
-    return 1
-  }
 }
 
 exec 9>"$LOCK_FILE"
@@ -651,16 +568,7 @@ NEW_REVISION=$(docker image inspect "$IMAGE_REF" --format '{{index .Config.Label
 OLD_IMAGE_ID=$(docker inspect "$CONTAINER" --format '{{.Image}}')
 prepare_rollback_image "$OLD_IMAGE_ID" || { audit rollback_image_prepare_failed; exit 1; }
 COUNTS_BEFORE=$(database_counts)
-IFS='|' read -r USERS_BEFORE CHANNELS_BEFORE OPENCODE_BEFORE <<< "$COUNTS_BEFORE"
-if [ "$EXPECTED_OPENCODE" = "preserve" ]; then
-  EXPECTED_OPENCODE=$OPENCODE_BEFORE
-fi
-if [ -n "$IMPORT_FILE" ] && [ "$OPENCODE_BEFORE" != "0" ]; then
-  log "FATAL: refusing import into non-empty OpenCode table"
-  audit import_refused
-  secure_delete "$IMPORT_FILE"
-  exit 1
-fi
+IFS='|' read -r USERS_BEFORE CHANNELS_BEFORE <<< "$COUNTS_BEFORE"
 
 if ! create_backup; then
   audit backup_failed
@@ -681,13 +589,6 @@ if ! create_final_backup; then
   exit 1
 fi
 normalize_production_data
-
-if [ -n "$IMPORT_FILE" ]; then
-  log "staging encrypted-at-startup OpenCode import"
-  cp "$IMPORT_FILE" "$DATA_DIR/opencode-import.json"
-  chmod 600 "$DATA_DIR/opencode-import.json"
-  secure_delete "$IMPORT_FILE"
-fi
 
 write_release_env "$IMAGE_REF"
 if ! compose_up "$IMAGE_REF" || ! verify_release "$USERS_BEFORE" "$CHANNELS_BEFORE"; then

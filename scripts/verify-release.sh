@@ -77,7 +77,6 @@ docker run -d --name "$VERIFY_CONTAINER" \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
   -e UPSTREAM_BALANCE_DATA_DIR=/app/data \
   -e REFRESH_INTERVAL_SECONDS=3600 \
-  -e OPENCODE_GO_ALERT_INTERVAL_SECONDS=3600 \
   -v "$VERIFY_DIR/data:/app/data" \
   -p 127.0.0.1:18756:8756 \
   "$VERIFY_IMAGE" >/dev/null
@@ -91,7 +90,7 @@ done
 curl --fail --silent http://127.0.0.1:18756/api/health >/dev/null
 curl --fail --silent http://127.0.0.1:18756/_ub_api/auth/bootstrap >/dev/null
 test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
-  http://127.0.0.1:18756/_ub_api/opencode/accounts)" = "401"
+  http://127.0.0.1:18756/_ub_api/channels)" = "401"
 
 echo "[7/7] verify image revision and filesystem permissions"
 test "$(docker image inspect "$VERIFY_IMAGE" \

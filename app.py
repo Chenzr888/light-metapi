@@ -1,4 +1,5 @@
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -10,8 +11,6 @@ import sqlite3
 import struct
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
-from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.message import EmailMessage
@@ -20,31 +19,33 @@ from pathlib import Path
 from urllib.parse import quote, urljoin
 
 import requests
+import auth_security
+import channel_catalog
 from cryptography.fernet import Fernet
 from flask import Flask, jsonify, request, send_from_directory, session
 from werkzeug.security import check_password_hash, generate_password_hash
-
-from opencode_go import (
-    OpenCodeError,
-    compute_pool_summary as compute_opencode_pool_summary,
-    evaluate_alerts as evaluate_opencode_alerts,
-    fetch_dashboard_quota as fetch_opencode_quota,
-    fetch_models as fetch_opencode_models,
-    format_alert_message as format_opencode_alert_message,
-    mask_api_key as mask_opencode_api_key,
-    parse_alert_thresholds,
-    parse_pool_alert_usd,
-    public_error as public_opencode_error,
-)
-
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("UPSTREAM_BALANCE_DATA_DIR", str(ROOT / "data"))).resolve()
 DB_PATH = DATA_DIR / "upstreams.sqlite3"
 KEY_PATH = DATA_DIR / "secret.key"
 SESSION_KEY_PATH = DATA_DIR / "session.secret"
+CHANNEL_CATALOG_PATH = Path(
+    os.getenv("UPSTREAM_CHANNEL_CATALOG_PATH", str(DATA_DIR / "channel-catalog.json"))
+).resolve()
 STATIC_DIR = ROOT / "static"
-REFRESH_INTERVAL_SECONDS = int(os.getenv("REFRESH_INTERVAL_SECONDS", "30"))
+REFRESH_INTERVAL_SECONDS = max(30, int(os.getenv("REFRESH_INTERVAL_SECONDS", "300")))
+CATALOG_SYNC_INTERVAL_SECONDS = max(30, int(os.getenv("CATALOG_SYNC_INTERVAL_SECONDS", "60")))
+CATALOG_ACCOUNT_SYNC_ENABLED = os.getenv("CATALOG_ACCOUNT_SYNC_ENABLED", "0") == "1"
+CATALOG_ACCOUNT_SYNC_INTERVAL_SECONDS = max(300, int(os.getenv("CATALOG_ACCOUNT_SYNC_INTERVAL_SECONDS", "3600")))
+CATALOG_NEW_API_USERNAME = os.getenv("CATALOG_NEW_API_USERNAME", "")
+CATALOG_NEW_API_PASSWORD = os.getenv("CATALOG_NEW_API_PASSWORD", "")
+CATALOG_SUB2API_USERNAME = os.getenv("CATALOG_SUB2API_USERNAME", "")
+CATALOG_SUB2API_PASSWORD = os.getenv("CATALOG_SUB2API_PASSWORD", "")
+ACCOUNT_REFRESH_ENABLED = os.getenv(
+    "ACCOUNT_REFRESH_ENABLED",
+    os.getenv("LEGACY_ACCOUNT_REFRESH_ENABLED", "1"),
+) == "1"
 NOTIFY_INTERVAL_SECONDS = int(os.getenv("NOTIFY_INTERVAL_SECONDS", "3600"))
 REQUEST_TIMEOUT = int(os.getenv("UPSTREAM_REQUEST_TIMEOUT", "25"))
 HISTORY_RETENTION_HOURS = int(os.getenv("HISTORY_RETENTION_HOURS", "72"))
@@ -52,29 +53,17 @@ DEFAULT_CNY_RATE = Decimal(os.getenv("DEFAULT_CNY_RATE", "7.3"))
 RECHARGE_ROUNDING_UNIT = Decimal(os.getenv("RECHARGE_ROUNDING_UNIT", "100"))
 LOW_BALANCE_ALERT_CNY = Decimal(os.getenv("LOW_BALANCE_ALERT_CNY", "100"))
 LOW_BALANCE_ALERT_COOLDOWN_SECONDS = int(os.getenv("LOW_BALANCE_ALERT_COOLDOWN_SECONDS", "21600"))
+CHANNEL_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("CHANNEL_ERROR_ALERT_COOLDOWN_SECONDS", "21600"))
 LOW_BALANCE_EMAIL_ENABLED = os.getenv("LOW_BALANCE_EMAIL_ENABLED", "0") == "1"
 LOW_BALANCE_EMAIL_FROM = os.getenv("LOW_BALANCE_EMAIL_FROM", "noreply@mail.sandboxai.top")
 LOW_BALANCE_EMAIL_SMTP_SERVER = os.getenv("LOW_BALANCE_EMAIL_SMTP_SERVER", "smtp.resend.com")
 LOW_BALANCE_EMAIL_SMTP_PORT = int(os.getenv("LOW_BALANCE_EMAIL_SMTP_PORT", "2587"))
 LOW_BALANCE_EMAIL_SMTP_USER = os.getenv("LOW_BALANCE_EMAIL_SMTP_USER", "resend")
 LOW_BALANCE_EMAIL_SMTP_TOKEN = os.getenv("LOW_BALANCE_EMAIL_SMTP_TOKEN", "")
-OPENCODE_GO_ORIGIN = os.getenv("OPENCODE_GO_ORIGIN", "https://opencode.ai").rstrip("/")
-OPENCODE_GO_ALERT_ENABLED = os.getenv("OPENCODE_GO_ALERT_ENABLED", "1") == "1"
-OPENCODE_GO_ALERT_INTERVAL_SECONDS = max(30, int(os.getenv("OPENCODE_GO_ALERT_INTERVAL_SECONDS", "60")))
-OPENCODE_GO_ALERT_THRESHOLDS = parse_alert_thresholds(os.getenv("OPENCODE_GO_ALERT_THRESHOLDS", "20,5,0"))
-OPENCODE_GO_POOL_ALERT_USD = parse_pool_alert_usd(
-    os.getenv("OPENCODE_GO_POOL_ALERT_USD", "rolling=20,weekly=80,monthly=300")
-)
-OPENCODE_GO_REFRESH_DEADLINE_SECONDS = max(
-    5, int(os.getenv("OPENCODE_GO_REFRESH_DEADLINE_SECONDS", "90"))
-)
-OPENCODE_GO_REFRESH_WORKERS = max(4, int(os.getenv("OPENCODE_GO_REFRESH_WORKERS", "16")))
-OPENCODE_GO_IMPORT_FILE = Path(
-    os.getenv("OPENCODE_GO_IMPORT_FILE", str(DATA_DIR / "opencode-import.json"))
-)
-OPENCODE_SOURCE_NOTE_MAX_LENGTH = 80
-
-
+ALLOW_ADMIN_REGISTRATION = os.getenv("ALLOW_ADMIN_REGISTRATION", "0") == "1"
+LOGIN_MAX_FAILURES = max(3, int(os.getenv("LOGIN_MAX_FAILURES", "5")))
+LOGIN_ATTEMPT_WINDOW_SECONDS = max(60, int(os.getenv("LOGIN_ATTEMPT_WINDOW_SECONDS", "900")))
+LOGIN_LOCK_SECONDS = max(60, int(os.getenv("LOGIN_LOCK_SECONDS", "900")))
 def read_or_create_secret(path, size=32):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(DATA_DIR, 0o700)
@@ -95,25 +84,6 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
 )
 refresh_lock = threading.Lock()
-opencode_cache = {}
-opencode_cache_lock = threading.Lock()
-opencode_refresh_lock = threading.Lock()
-opencode_alert_lock = threading.Lock()
-opencode_executor = ThreadPoolExecutor(
-    max_workers=OPENCODE_GO_REFRESH_WORKERS,
-    thread_name_prefix="opencode-go",
-)
-opencode_alert_status = {
-    "enabled": False,
-    "running": False,
-    "interval_seconds": OPENCODE_GO_ALERT_INTERVAL_SECONDS,
-    "thresholds": OPENCODE_GO_ALERT_THRESHOLDS,
-    "pool_thresholds_usd": OPENCODE_GO_POOL_ALERT_USD,
-    "last_run_at": None,
-    "last_success_at": None,
-    "last_error": None,
-    "delivered_events": 0,
-}
 
 
 class UbMethodOverrideMiddleware:
@@ -129,10 +99,6 @@ class UbMethodOverrideMiddleware:
 
 
 app.wsgi_app = UbMethodOverrideMiddleware(app.wsgi_app)
-
-
-class OpenCodeRefreshBusy(RuntimeError):
-    pass
 
 
 def now_iso():
@@ -177,6 +143,7 @@ def db():
 def init_db():
     with db() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
+        channel_catalog.ensure_schema(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS channels (
@@ -202,6 +169,7 @@ def init_db():
             )
             """
         )
+        auth_security.ensure_schema(conn)
         ensure_column(conn, "channels", "credential_enc", "TEXT")
         ensure_column(conn, "channels", "cny_rate", "REAL")
         ensure_column(conn, "channels", "alert_cny", "REAL")
@@ -288,6 +256,39 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS channel_discovery (
+                base_url TEXT PRIMARY KEY,
+                source_names TEXT NOT NULL DEFAULT '',
+                platform TEXT,
+                state TEXT NOT NULL DEFAULT 'pending',
+                message TEXT,
+                channel_id INTEGER,
+                checked_at TEXT NOT NULL,
+                FOREIGN KEY(channel_id) REFERENCES channels(id) ON DELETE SET NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channel_exclusions (
+                base_url TEXT PRIMARY KEY,
+                reason TEXT NOT NULL DEFAULT '手动移除',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO channel_exclusions(base_url, reason, created_at, updated_at)
+            SELECT base_url, '已按要求关闭', checked_at, checked_at
+            FROM channel_discovery
+            WHERE state = 'excluded'
+            ON CONFLICT(base_url) DO NOTHING
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL UNIQUE,
@@ -299,23 +300,12 @@ def init_db():
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS opencode_accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_key TEXT NOT NULL UNIQUE,
-                label TEXT NOT NULL,
-                source_note TEXT NOT NULL DEFAULT '',
-                workspace_id TEXT NOT NULL DEFAULT '',
-                auth_cookie_enc TEXT NOT NULL DEFAULT '',
-                api_key_enc TEXT NOT NULL DEFAULT '',
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        ensure_column(conn, "opencode_accounts", "source_note", "TEXT NOT NULL DEFAULT ''")
+        # OpenCode monitoring was retired. Purge its encrypted credentials and
+        # alert state on upgrade instead of leaving unused secrets behind.
+        conn.execute("DROP TABLE IF EXISTS opencode_accounts")
+        conn.execute("DELETE FROM settings WHERE key = 'opencode_alert_state'")
+
+    (DATA_DIR / "opencode-import.json").unlink(missing_ok=True)
 
 
 def ensure_column(conn, table, column, column_type):
@@ -369,387 +359,8 @@ def public_settings():
         "recharge_rounding_unit": as_float(RECHARGE_ROUNDING_UNIT),
         "low_balance_alert_cny": as_float(LOW_BALANCE_ALERT_CNY),
         "low_balance_alert_cooldown_seconds": LOW_BALANCE_ALERT_COOLDOWN_SECONDS,
+        "channel_error_alert_cooldown_seconds": CHANNEL_ERROR_ALERT_COOLDOWN_SECONDS,
     }
-
-
-def validate_opencode_workspace_id(value):
-    workspace_id = str(value or "").strip()
-    if workspace_id and not re.fullmatch(r"wrk_[A-Za-z0-9]+", workspace_id):
-        raise ValueError("Workspace ID 格式应为 wrk_ 开头的字母数字串")
-    return workspace_id
-
-
-def validate_opencode_source_note(value):
-    source_note = str(value or "").strip()
-    if len(source_note) > OPENCODE_SOURCE_NOTE_MAX_LENGTH:
-        raise ValueError(f"来源备注不能超过 {OPENCODE_SOURCE_NOTE_MAX_LENGTH} 个字符")
-    return source_note
-
-
-def normalize_opencode_account_key(value, fallback="account"):
-    account_key = re.sub(r"[^a-z0-9_-]+", "-", str(value or "").strip().lower()).strip("-_")
-    account_key = (account_key or fallback)[:40]
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,39}", account_key):
-        raise ValueError("账号 ID 需要使用小写字母、数字、下划线或连字符")
-    return account_key
-
-
-def unique_opencode_account_key(conn, preferred):
-    candidate = preferred
-    suffix = 2
-    while conn.execute("SELECT 1 FROM opencode_accounts WHERE account_key = ?", (candidate,)).fetchone():
-        ending = f"-{suffix}"
-        candidate = f"{preferred[:40 - len(ending)]}{ending}"
-        suffix += 1
-    return candidate
-
-
-def list_opencode_account_rows(enabled_only=False):
-    where = "WHERE enabled = 1" if enabled_only else ""
-    with db() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM opencode_accounts {where} ORDER BY id ASC"
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def get_opencode_account(account_id):
-    with db() as conn:
-        row = conn.execute("SELECT * FROM opencode_accounts WHERE id = ?", (account_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def public_opencode_account(row):
-    api_key = decrypt(row.get("api_key_enc", "")) if row.get("api_key_enc") else ""
-    workspace_id = row.get("workspace_id") or ""
-    has_auth_cookie = bool(row.get("auth_cookie_enc"))
-    has_api_key = bool(api_key)
-    return {
-        "id": row["id"],
-        "account_key": row["account_key"],
-        "label": row["label"],
-        "source_note": str(row.get("source_note") or ""),
-        "workspace_id": workspace_id or None,
-        "quota_configured": bool(workspace_id and has_auth_cookie),
-        "models_configured": has_api_key,
-        "has_auth_cookie": has_auth_cookie,
-        "has_api_key": has_api_key,
-        "api_key_hint": mask_opencode_api_key(api_key),
-        "enabled": bool(row.get("enabled", 1)),
-        "quota": None,
-        "quota_error": None,
-        "models": None,
-        "models_error": None,
-    }
-
-
-def clear_opencode_cache(account_id=None):
-    with opencode_cache_lock:
-        if account_id is None:
-            opencode_cache.clear()
-            return
-        suffix = f":{account_id}"
-        for key in [item for item in opencode_cache if item.endswith(suffix)]:
-            opencode_cache.pop(key, None)
-
-
-def opencode_secret_fingerprint(*values):
-    raw = "\0".join(str(value or "") for value in values)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def opencode_cached_value(bucket, fingerprint, ttl_seconds, stale_seconds, force, loader):
-    with opencode_cache_lock:
-        cached = deepcopy(opencode_cache.get(bucket))
-    age = time.time() - cached["stored_at"] if cached else float("inf")
-    if not force and cached and cached["fingerprint"] == fingerprint and age < ttl_seconds:
-        value = deepcopy(cached["value"])
-        value["cache"] = {"status": "fresh", "age_seconds": int(age)}
-        return value
-    try:
-        value = loader()
-        with opencode_cache_lock:
-            opencode_cache[bucket] = {
-                "fingerprint": fingerprint,
-                "stored_at": time.time(),
-                "value": deepcopy(value),
-            }
-        result = deepcopy(value)
-        result["cache"] = {"status": "live", "age_seconds": 0}
-        return result
-    except Exception as exc:
-        if cached and cached["fingerprint"] == fingerprint and age < stale_seconds:
-            value = deepcopy(cached["value"])
-            value["cache"] = {
-                "status": "stale",
-                "age_seconds": int(age),
-                "warning": str(exc),
-            }
-            return value
-        raise
-
-
-def fetch_opencode_account_part(row, kind, force=False):
-    account_id = row["id"]
-    if kind == "quota":
-        workspace_id = row.get("workspace_id") or ""
-        auth_cookie = decrypt(row.get("auth_cookie_enc", ""))
-        fingerprint = opencode_secret_fingerprint(workspace_id, auth_cookie)
-        return opencode_cached_value(
-            f"quota:{account_id}",
-            fingerprint,
-            ttl_seconds=45,
-            stale_seconds=600,
-            force=force,
-            loader=lambda: fetch_opencode_quota(
-                workspace_id,
-                auth_cookie,
-                origin=OPENCODE_GO_ORIGIN,
-                timeout=REQUEST_TIMEOUT,
-            ),
-        )
-    api_key = decrypt(row.get("api_key_enc", ""))
-    fingerprint = opencode_secret_fingerprint(api_key)
-    return opencode_cached_value(
-        f"models:{account_id}",
-        fingerprint,
-        ttl_seconds=600,
-        stale_seconds=3600,
-        force=force,
-        loader=lambda: fetch_opencode_models(
-            api_key,
-            origin=OPENCODE_GO_ORIGIN,
-            timeout=REQUEST_TIMEOUT,
-        ),
-    )
-
-
-def load_opencode_accounts(force=False, deadline_seconds=None, reject_if_busy=False):
-    acquired = opencode_refresh_lock.acquire(blocking=not reject_if_busy)
-    if not acquired:
-        raise OpenCodeRefreshBusy("OpenCode Go 正在刷新，请稍后重试")
-    try:
-        return _load_opencode_accounts(force=force, deadline_seconds=deadline_seconds)
-    finally:
-        opencode_refresh_lock.release()
-
-
-def _load_opencode_accounts(force=False, deadline_seconds=None):
-    rows = list_opencode_account_rows(enabled_only=True)
-    states = [public_opencode_account(row) for row in rows]
-    futures = {}
-    for index, row in enumerate(rows):
-        if states[index]["quota_configured"]:
-            future = opencode_executor.submit(fetch_opencode_account_part, row, "quota", force)
-            futures[future] = (index, "quota")
-        if states[index]["models_configured"]:
-            future = opencode_executor.submit(fetch_opencode_account_part, row, "models", force)
-            futures[future] = (index, "models")
-    deadline = OPENCODE_GO_REFRESH_DEADLINE_SECONDS if deadline_seconds is None else max(0, deadline_seconds)
-    completed, pending = wait(futures, timeout=deadline)
-    for future in completed:
-        index, kind = futures[future]
-        try:
-            states[index][kind] = future.result()
-        except Exception as exc:
-            states[index][f"{kind}_error"] = public_opencode_error(exc)
-    for future in pending:
-        index, kind = futures[future]
-        future.cancel()
-        states[index][f"{kind}_error"] = public_opencode_error(
-            OpenCodeError(
-                f"刷新超过整体时限（{deadline:g} 秒），已返回其他可用结果",
-                code="REFRESH_DEADLINE_EXCEEDED",
-                status_code=504,
-            )
-        )
-    return states
-
-
-def public_opencode_bundle(accounts):
-    return {
-        "accounts": accounts,
-        "pool": compute_opencode_pool_summary(
-            accounts,
-            alert_thresholds=OPENCODE_GO_POOL_ALERT_USD,
-        ),
-    }
-
-
-def save_opencode_account(payload, account_id=None):
-    current = get_opencode_account(account_id) if account_id is not None else None
-    if account_id is not None and not current:
-        raise LookupError("OpenCode Go 账号不存在")
-
-    label = str(payload.get("label") or (current or {}).get("label") or "").strip()
-    if not label:
-        raise ValueError("账号名称不能为空")
-    source_note = validate_opencode_source_note(
-        payload.get("source_note", (current or {}).get("source_note", ""))
-    )
-    if payload.get("clear_workspace_id"):
-        workspace_id = ""
-    else:
-        workspace_id = validate_opencode_workspace_id(
-            payload.get("workspace_id", (current or {}).get("workspace_id", ""))
-        )
-
-    current_auth_cookie = decrypt(current.get("auth_cookie_enc", "")) if current else ""
-    current_api_key = decrypt(current.get("api_key_enc", "")) if current else ""
-    incoming_auth_cookie = str(payload.get("auth_cookie") or "").strip()
-    incoming_api_key = str(payload.get("api_key") or "").strip()
-    auth_cookie = "" if payload.get("clear_auth_cookie") else incoming_auth_cookie or current_auth_cookie
-    api_key = "" if payload.get("clear_api_key") else incoming_api_key or current_api_key
-    if not workspace_id and not auth_cookie and not api_key:
-        raise ValueError("请至少配置 Workspace、auth Cookie 或 API key")
-    enabled = 1 if payload.get("enabled", (current or {}).get("enabled", 1)) else 0
-    ts = now_iso()
-    with db() as conn:
-        if current:
-            conn.execute(
-                """
-                UPDATE opencode_accounts
-                SET label = ?, source_note = ?, workspace_id = ?, auth_cookie_enc = ?, api_key_enc = ?, enabled = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (label, source_note, workspace_id, encrypt(auth_cookie), encrypt(api_key), enabled, ts, account_id),
-            )
-            saved_id = account_id
-        else:
-            preferred = normalize_opencode_account_key(payload.get("account_key") or label, "account")
-            account_key = unique_opencode_account_key(conn, preferred)
-            cur = conn.execute(
-                """
-                INSERT INTO opencode_accounts(
-                    account_key, label, source_note, workspace_id, auth_cookie_enc, api_key_enc,
-                    enabled, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (account_key, label, source_note, workspace_id, encrypt(auth_cookie), encrypt(api_key), enabled, ts, ts),
-            )
-            saved_id = cur.lastrowid
-    clear_opencode_cache(saved_id)
-    return public_opencode_account(get_opencode_account(saved_id))
-
-
-def import_opencode_accounts(path=OPENCODE_GO_IMPORT_FILE):
-    import_path = Path(path)
-    if not import_path.exists():
-        return 0
-    try:
-        payload = json.loads(import_path.read_text(encoding="utf-8"))
-        accounts = payload.get("accounts") if isinstance(payload, dict) else None
-        if not isinstance(accounts, list):
-            raise ValueError("OpenCode 导入文件缺少 accounts 数组")
-        prepared = []
-        for index, account in enumerate(accounts):
-            if not isinstance(account, dict):
-                continue
-            workspace_id = validate_opencode_workspace_id(account.get("workspaceId"))
-            auth_cookie = str(account.get("authCookie") or "").strip()
-            api_key = str(account.get("apiKey") or "").strip()
-            if not workspace_id and not auth_cookie and not api_key:
-                continue
-            label = str(account.get("label") or f"账号 {index + 1}").strip() or f"账号 {index + 1}"
-            source_note = validate_opencode_source_note(
-                account.get("sourceNote", account.get("source_note", ""))
-            )
-            account_key = normalize_opencode_account_key(account.get("id"), f"account-{index + 1}")
-            prepared.append((account_key, label, source_note, workspace_id, auth_cookie, api_key))
-
-        with db() as conn:
-            existing = conn.execute("SELECT COUNT(*) FROM opencode_accounts").fetchone()[0]
-            if existing:
-                imported = 0
-            else:
-                imported = 0
-                ts = now_iso()
-                for account_key, label, source_note, workspace_id, auth_cookie, api_key in prepared:
-                    account_key = unique_opencode_account_key(conn, account_key)
-                    conn.execute(
-                        """
-                        INSERT INTO opencode_accounts(
-                            account_key, label, source_note, workspace_id, auth_cookie_enc, api_key_enc,
-                            enabled, created_at, updated_at
-                        ) VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?)
-                        """,
-                        (
-                            account_key,
-                            label,
-                            source_note,
-                            workspace_id,
-                            encrypt(auth_cookie),
-                            encrypt(api_key),
-                            ts,
-                            ts,
-                        ),
-                    )
-                    imported += 1
-        import_path.unlink(missing_ok=True)
-        print(f"[opencode-go] imported_accounts={imported} plaintext_import_removed=1", flush=True)
-        return imported
-    except Exception as exc:
-        print(f"[opencode-go] import failed: {exc}", flush=True)
-        return 0
-
-
-def opencode_notifications_enabled():
-    return OPENCODE_GO_ALERT_ENABLED and (
-        notification_webhooks_configured() or low_balance_email_configured()
-    )
-
-
-def public_opencode_alert_status():
-    with opencode_alert_lock:
-        status = dict(opencode_alert_status)
-    status["enabled"] = opencode_notifications_enabled()
-    return status
-
-
-def deliver_opencode_event(event):
-    content = format_opencode_alert_message(event)
-    webhook_sent = post_notification_text(content) if notification_webhooks_configured() else []
-    email_sent = post_low_balance_email(content.splitlines()[0], content) if low_balance_email_configured() else False
-    return bool(webhook_sent or email_sent)
-
-
-def run_opencode_alert_monitor(force=False):
-    if not opencode_alert_lock.acquire(blocking=False):
-        return public_opencode_alert_status()
-    try:
-        opencode_alert_status["running"] = True
-        opencode_alert_status["enabled"] = opencode_notifications_enabled()
-        opencode_alert_status["last_run_at"] = now_iso()
-        if not opencode_alert_status["enabled"]:
-            return dict(opencode_alert_status)
-        accounts = load_opencode_accounts(force=False)
-        try:
-            previous = json.loads(setting_get("opencode_alert_state", "{}") or "{}")
-        except json.JSONDecodeError:
-            previous = {}
-        evaluation = evaluate_opencode_alerts(
-            accounts,
-            previous_state=previous,
-            thresholds=OPENCODE_GO_ALERT_THRESHOLDS,
-            pool_thresholds=OPENCODE_GO_POOL_ALERT_USD,
-        )
-        delivered = 0
-        for event in evaluation["events"]:
-            if not deliver_opencode_event(event):
-                raise RuntimeError("OpenCode Go 告警通道发送失败")
-            delivered += 1
-        setting_set("opencode_alert_state", json.dumps(evaluation["state"], ensure_ascii=False))
-        opencode_alert_status["last_success_at"] = now_iso()
-        opencode_alert_status["last_error"] = None
-        opencode_alert_status["delivered_events"] += delivered
-    except Exception as exc:
-        opencode_alert_status["last_error"] = str(exc)
-        print(f"[opencode-go] alert monitor failed: {exc}", flush=True)
-    finally:
-        opencode_alert_status["running"] = False
-        status = dict(opencode_alert_status)
-        opencode_alert_lock.release()
-    return status
 
 
 def normalize_url(base_url):
@@ -759,6 +370,221 @@ def normalize_url(base_url):
     if not value.startswith(("http://", "https://")):
         value = "https://" + value
     return value.rstrip("/") + "/"
+
+
+def catalog_account_candidates(path=CHANNEL_CATALOG_PATH):
+    if not Path(path).exists():
+        return []
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    grouped = {}
+    for item in payload.get("channels", []):
+        try:
+            base_url = normalize_url(item.get("base_url"))
+        except (AttributeError, ValueError):
+            continue
+        entry = grouped.setdefault(base_url, {"base_url": base_url, "names": []})
+        name = str(item.get("name") or "").strip()
+        if name and name not in entry["names"]:
+            entry["names"].append(name)
+    return list(grouped.values())
+
+
+def detect_upstream_platform(base_url):
+    base_url = normalize_url(base_url)
+    errors = []
+    try:
+        response = requests.get(
+            urljoin(base_url, "/api/status"),
+            headers={"Accept": "application/json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        payload = safe_json(response)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if response.status_code < 400 and isinstance(data, dict) and data:
+            return "new_api", "识别为 New API"
+        errors.append(f"New API HTTP {response.status_code}")
+    except requests.RequestException as exc:
+        errors.append(f"New API {type(exc).__name__}")
+
+    try:
+        response = requests.get(
+            urljoin(base_url, "/api/v1/auth/me"),
+            headers={"Accept": "application/json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        payload = safe_json(response)
+        if response.status_code in (401, 403) and isinstance(payload, dict):
+            return "sub2api", "识别为 Sub2API"
+        errors.append(f"Sub2API HTTP {response.status_code}")
+    except requests.RequestException as exc:
+        errors.append(f"Sub2API {type(exc).__name__}")
+    return "", "; ".join(errors)
+
+
+def save_discovery_result(candidate, platform, state, message, channel_id=None):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO channel_discovery(base_url, source_names, platform, state, message, channel_id, checked_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(base_url) DO UPDATE SET
+                source_names = excluded.source_names,
+                platform = excluded.platform,
+                state = excluded.state,
+                message = excluded.message,
+                channel_id = excluded.channel_id,
+                checked_at = excluded.checked_at
+            """,
+            (
+                candidate["base_url"],
+                json.dumps(candidate.get("names") or [], ensure_ascii=False),
+                platform or None,
+                state,
+                str(message or "")[:1000],
+                channel_id,
+                now_iso(),
+            ),
+        )
+
+
+def list_discovery_results():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT base_url, source_names, platform, state, message, channel_id, checked_at "
+            "FROM channel_discovery ORDER BY base_url"
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["source_names"] = json.loads(item["source_names"] or "[]")
+        except json.JSONDecodeError:
+            item["source_names"] = []
+        result.append(item)
+    return result
+
+
+def list_catalog_exclusions():
+    with db() as conn:
+        rows = conn.execute("SELECT base_url, reason FROM channel_exclusions").fetchall()
+    return {normalize_url(row["base_url"]): row["reason"] for row in rows}
+
+
+def exclude_catalog_address(base_url, reason="手动移除"):
+    base_url = normalize_url(base_url)
+    ts = now_iso()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO channel_exclusions(base_url, reason, created_at, updated_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(base_url) DO UPDATE SET reason=excluded.reason, updated_at=excluded.updated_at
+            """,
+            (base_url, str(reason or "手动移除")[:200], ts, ts),
+        )
+        conn.execute(
+            """
+            INSERT INTO channel_discovery(base_url, source_names, state, message, checked_at)
+            VALUES(?, '[]', 'excluded', ?, ?)
+            ON CONFLICT(base_url) DO UPDATE SET state='excluded', message=excluded.message, checked_at=excluded.checked_at
+            """,
+            (base_url, str(reason or "手动移除")[:200], ts),
+        )
+
+
+def restore_catalog_address(base_url):
+    base_url = normalize_url(base_url)
+    with db() as conn:
+        conn.execute("DELETE FROM channel_exclusions WHERE base_url = ?", (base_url,))
+        conn.execute(
+            "UPDATE channel_discovery SET state='pending', message='等待重新识别', checked_at=? WHERE base_url=? AND state='excluded'",
+            (now_iso(), base_url),
+        )
+
+
+def list_catalog_routes():
+    if not CHANNEL_CATALOG_PATH.exists():
+        return {"items": [], "summary": {"routes": 0, "addresses": 0, "monitored_addresses": 0, "pending_addresses": 0, "excluded_addresses": 0}}
+    payload = json.loads(CHANNEL_CATALOG_PATH.read_text(encoding="utf-8"))
+    with db() as conn:
+        monitor_rows = conn.execute("SELECT * FROM channels ORDER BY id").fetchall()
+    monitors = {normalize_url(row["base_url"]): row_to_channel(row) for row in monitor_rows}
+    discoveries = {item["base_url"]: item for item in list_discovery_results()}
+    exclusions = list_catalog_exclusions()
+    grouped = {}
+    for source in payload.get("channels", []):
+        try:
+            base_url = normalize_url(source.get("base_url"))
+        except (AttributeError, ValueError):
+            base_url = str(source.get("base_url") or "")
+        if not base_url:
+            continue
+        models = source.get("models") or []
+        if isinstance(models, str):
+            models = [item.strip() for item in models.split(",") if item.strip()]
+        item = grouped.setdefault(base_url, {
+            "id": source.get("id"),
+            "route_ids": [],
+            "name": source.get("name") or f"渠道 {source.get('id')}",
+            "route_status": source.get("status"),
+            "base_url": base_url,
+            "group": source.get("group") or "",
+            "models": [],
+        })
+        if source.get("id") is not None:
+            item["route_ids"].append(source.get("id"))
+        if source.get("name") and source.get("name") != item["name"]:
+            item.setdefault("route_names", []).append(source.get("name"))
+        if source.get("status") == 1:
+            item["route_status"] = 1
+        if not item["group"] and source.get("group"):
+            item["group"] = source.get("group")
+        item["models"] = sorted(set(item["models"]) | set(models))
+
+    items = []
+    for base_url, item in grouped.items():
+        monitor = monitors.get(base_url)
+        discovery = discoveries.get(base_url, {})
+        if base_url in exclusions and not monitor:
+            discovery = {**discovery, "state": "excluded", "message": exclusions[base_url]}
+        item["platform"] = monitor.get("platform") if monitor else discovery.get("platform")
+        item["monitor"] = monitor
+        item["discovery_state"] = discovery.get("state") or "pending"
+        item["discovery_message"] = discovery.get("message") or "等待识别"
+        items.append(item)
+    items.sort(key=lambda item: (int(item["id"]) if str(item.get("id", "")).isdigit() else 0, item["base_url"]))
+    monitored_addresses = len({item["base_url"] for item in items if item["monitor"]})
+    excluded_addresses = len({item["base_url"] for item in items if item["discovery_state"] == "excluded"})
+    return {
+        "items": items,
+        "generated_at": payload.get("generated_at"),
+        "summary": {
+            "routes": len(items),
+            "addresses": len(items),
+            "monitored_addresses": monitored_addresses,
+            "pending_addresses": len(items) - monitored_addresses - excluded_addresses,
+            "excluded_addresses": excluded_addresses,
+        },
+    }
+
+
+def save_catalog_sync_credentials(new_api_username, new_api_password, sub2api_username, sub2api_password):
+    setting_set("catalog_new_api_username", new_api_username)
+    setting_set("catalog_new_api_password_enc", encrypt(new_api_password))
+    setting_set("catalog_sub2api_username", sub2api_username)
+    setting_set("catalog_sub2api_password_enc", encrypt(sub2api_password))
+    setting_set("catalog_account_sync_enabled", "1")
+
+
+def catalog_sync_credentials():
+    new_password_enc = setting_get("catalog_new_api_password_enc")
+    sub_password_enc = setting_get("catalog_sub2api_password_enc")
+    return (
+        setting_get("catalog_new_api_username", CATALOG_NEW_API_USERNAME),
+        decrypt(new_password_enc) if new_password_enc else CATALOG_NEW_API_PASSWORD,
+        setting_get("catalog_sub2api_username", CATALOG_SUB2API_USERNAME),
+        decrypt(sub_password_enc) if sub_password_enc else CATALOG_SUB2API_PASSWORD,
+    )
 
 
 def decimal_from(value):
@@ -893,11 +719,24 @@ def auth_state(user=None):
     return state
 
 
+def login_attempt_key(username):
+    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    client_address = forwarded or request.remote_addr or "unknown"
+    return auth_security.attempt_key(username, client_address)
+
+
+def login_rate_limit_response(retry_after):
+    response = jsonify({"ok": False, "message": "登录尝试过多，请稍后再试"})
+    response.status_code = 429
+    response.headers["Retry-After"] = str(retry_after)
+    return response
+
+
 def login_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if user_count() == 0:
-            return response_error("请先创建管理员账号", 401)
+            return response_error("管理员账号尚未预设", 401)
         if not current_user():
             return response_error("请先登录", 401)
         return fn(*args, **kwargs)
@@ -1207,10 +1046,20 @@ def save_channel_credential(channel_id, credential):
         conn.execute(
             """
             UPDATE channels
-            SET credential_enc = ?, password_enc = '', updated_at = ?
+            SET credential_enc = ?, updated_at = ?
             WHERE id = ?
             """,
             (encrypt(json.dumps(credential, ensure_ascii=False)), now_iso(), channel_id),
+        )
+
+
+def save_channel_password(channel_id, password):
+    if not password:
+        return
+    with db() as conn:
+        conn.execute(
+            "UPDATE channels SET password_enc = ?, updated_at = ? WHERE id = ?",
+            (encrypt(password), now_iso(), channel_id),
         )
 
 
@@ -1340,11 +1189,19 @@ def new_api_headers(credential):
     headers = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
     token = credential.get("access_token")
     user_id = credential.get("user_id")
-    if token:
+    if token and credential.get("auth_mode") != "session_cookie":
         headers["Authorization"] = f"Bearer {token}"
     if user_id:
         headers["New-Api-User"] = str(user_id)
     return headers
+
+
+def new_api_client(credential, session=None):
+    client = session or requests.Session()
+    cookies = credential.get("cookies") if isinstance(credential, dict) else None
+    if isinstance(cookies, dict) and cookies:
+        client.cookies.update(cookies)
+    return client
 
 
 def new_api_topup_amount(base_url, item):
@@ -1514,7 +1371,9 @@ def safe_sub2api_recharge_logs(base_url, access_token):
 
 def sub2api_token_error(exc):
     message = str(exc).lower()
-    return any(marker in message for marker in ("401", "unauthorized", "unauthenticated", "token", "expired"))
+    return any(marker in message for marker in (
+        "401", "unauthorized", "unauthenticated", "token", "expired", "fingerprint", "login again",
+    ))
 
 
 def sub2api_recharge_logs(base_url, access_token):
@@ -1601,12 +1460,16 @@ def fetch_sub2api(channel):
         except RuntimeError as exc:
             if not sub2api_token_error(exc):
                 raise
-            credential = sub2api_refresh(base_url, credential.get("refresh_token"))
-            if channel_id:
-                save_channel_credential(channel_id, credential)
-            result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]))
-            result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
-            return result
+            try:
+                credential = sub2api_refresh(base_url, credential.get("refresh_token"))
+                if channel_id:
+                    save_channel_credential(channel_id, credential)
+                result = build_sub2api_result(sub2api_profile(base_url, credential["access_token"]))
+                result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
+                return result
+            except RuntimeError:
+                if not channel_value(channel, "password_enc", ""):
+                    raise
 
     password_enc = channel_value(channel, "password_enc", "")
     if not password_enc:
@@ -1619,19 +1482,71 @@ def fetch_sub2api(channel):
     return result
 
 
+def new_api_login_capabilities(base_url, session):
+    try:
+        status = session.get(
+            urljoin(base_url, "/api/status"),
+            headers={"Accept": "application/json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        payload = safe_json(status)
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        return {
+            "turnstile_required": bool(data.get("turnstile_check")),
+            "user_agreement_enabled": bool(data.get("user_agreement_enabled")),
+            "privacy_policy_enabled": bool(data.get("privacy_policy_enabled")),
+            "password_login_enabled": data.get("password_login_enabled", True) is not False,
+            "version": str(data.get("version") or ""),
+        }
+    except (AttributeError, requests.RequestException):
+        return {}
+
+
+def new_api_session_user(base_url, session):
+    response = session.get(
+        urljoin(base_url, "/api/user/self"),
+        headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    payload = safe_json(response)
+    if response.status_code >= 400 or not truthy_success(payload):
+        raise RuntimeError(read_message(payload) or f"读取登录用户失败 HTTP {response.status_code}")
+    return payload.get("data") if isinstance(payload.get("data"), dict) else {}
+
+
+def apply_new_api_login_payload(session, payload):
+    data = payload if isinstance(payload, dict) else {}
+    user = data.get("user") if isinstance(data.get("user"), dict) else data
+    access_token = data.get("access_token")
+    if isinstance(access_token, str) and access_token:
+        token_type = str(data.get("token_type") or "Bearer").strip() or "Bearer"
+        session.headers["Authorization"] = f"{token_type} {access_token}"
+        if user.get("id"):
+            session.headers["New-Api-User"] = str(user["id"])
+    return user
+
+
 def new_api_login(base_url, username, password, totp_code=""):
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
+    capabilities = new_api_login_capabilities(base_url, session)
+    if capabilities.get("password_login_enabled") is False:
+        raise RuntimeError("上游已关闭账号密码登录，无法自动添加该渠道")
+    if capabilities.get("turnstile_required"):
+        raise RuntimeError("上游登录开启了 Turnstile 人机验证，暂不支持自动添加；请先在上游关闭登录 Turnstile")
     login = session.post(
         urljoin(base_url, "/api/user/login"),
+        params={"turnstile": ""},
         json={"username": username, "password": password},
         timeout=REQUEST_TIMEOUT,
     )
     login_data = safe_json(login)
     if login.status_code >= 400 or not truthy_success(login_data):
-        raise RuntimeError(read_message(login_data) or f"登录失败 HTTP {login.status_code}")
+        detail = read_message(login_data) or f"HTTP {login.status_code}"
+        raise RuntimeError(f"登录阶段失败: {detail}")
 
-    user = login_data.get("data") if isinstance(login_data.get("data"), dict) else {}
+    login_payload = login_data.get("data") if isinstance(login_data.get("data"), dict) else {}
+    user = apply_new_api_login_payload(session, login_payload)
     if user.get("require_2fa"):
         code = "".join(ch for ch in str(totp_code or "") if ch.isdigit())
         if not code:
@@ -1643,14 +1558,35 @@ def new_api_login(base_url, username, password, totp_code=""):
         )
         twofa_data = safe_json(twofa)
         if twofa.status_code >= 400 or not truthy_success(twofa_data):
-            raise RuntimeError(read_message(twofa_data) or f"2FA 登录失败 HTTP {twofa.status_code}")
-        user = twofa_data.get("data") if isinstance(twofa_data.get("data"), dict) else {}
+            detail = read_message(twofa_data) or f"HTTP {twofa.status_code}"
+            raise RuntimeError(f"2FA 登录阶段失败: {detail}")
+        twofa_payload = twofa_data.get("data") if isinstance(twofa_data.get("data"), dict) else {}
+        user = apply_new_api_login_payload(session, twofa_payload)
+    if not user.get("id"):
+        try:
+            user = new_api_session_user(base_url, session)
+        except (AttributeError, requests.RequestException, RuntimeError) as exc:
+            raise RuntimeError(f"登录成功但读取用户信息失败: {exc}") from exc
     return session, user
 
 
 def new_api_generate_token(base_url, session, user_id):
     if not user_id:
-        raise RuntimeError("登录响应里没有用户 ID")
+        raise RuntimeError("令牌生成阶段失败: 登录响应里没有用户 ID")
+    authorization = str(session.headers.get("Authorization") or "")
+    try:
+        cookies = requests.utils.dict_from_cookiejar(session.cookies)
+    except (AttributeError, TypeError):
+        cookies = {}
+    if authorization.lower().startswith("bearer ") and authorization[7:].strip():
+        return {
+            "kind": "new_api_access_token",
+            "access_token": authorization[7:].strip(),
+            "user_id": user_id,
+            "auth_mode": "bearer",
+            "cookies": cookies,
+            "issued_at": now_iso(),
+        }
     token_resp = session.get(
         urljoin(base_url, "/api/user/token"),
         headers={"New-Api-User": str(user_id), "X-Requested-With": "XMLHttpRequest"},
@@ -1658,14 +1594,17 @@ def new_api_generate_token(base_url, session, user_id):
     )
     token_data = safe_json(token_resp)
     if token_resp.status_code >= 400 or not truthy_success(token_data):
-        raise RuntimeError(read_message(token_data) or f"生成 access token 失败 HTTP {token_resp.status_code}")
+        detail = read_message(token_data) or f"HTTP {token_resp.status_code}"
+        raise RuntimeError(f"令牌生成阶段失败: {detail}")
     token = token_data.get("data")
     if not isinstance(token, str) or not token:
-        raise RuntimeError("生成 access token 响应为空")
+        raise RuntimeError("令牌生成阶段失败: access token 响应为空")
     return {
         "kind": "new_api_access_token",
         "access_token": token,
         "user_id": user_id,
+        "auth_mode": "session_cookie" if cookies else "bearer",
+        "cookies": cookies,
         "issued_at": now_iso(),
     }
 
@@ -1674,7 +1613,7 @@ def new_api_self(base_url, credential, session=None):
     headers = new_api_headers(credential)
     user_id = credential.get("user_id")
 
-    client = session or requests.Session()
+    client = new_api_client(credential, session)
     self_resp = client.get(urljoin(base_url, "/api/user/self"), headers=headers, timeout=REQUEST_TIMEOUT)
     self_data = safe_json(self_resp)
     if self_resp.status_code == 401 and "New-Api-User" in read_message(self_data) and user_id:
@@ -1688,7 +1627,7 @@ def new_api_self(base_url, credential, session=None):
 
 def new_api_topup_logs(base_url, credential, session=None):
     headers = new_api_headers(credential)
-    client = session or requests.Session()
+    client = new_api_client(credential, session)
     resp = client.get(
         urljoin(base_url, "/api/user/topup/self"),
         params={"p": 1, "page_size": 50},
@@ -1729,7 +1668,7 @@ def new_api_topup_logs(base_url, credential, session=None):
 
 def new_api_log_recharge_logs(base_url, credential, session=None):
     headers = new_api_headers(credential)
-    client = session or requests.Session()
+    client = new_api_client(credential, session)
     quota_unit = None
     logs = []
     for log_type in (NEW_API_LOG_TYPE_TOPUP, NEW_API_LOG_TYPE_MANAGE):
@@ -1804,13 +1743,20 @@ def fetch_new_api(channel):
     base_url = normalize_url(channel["base_url"])
     credential = load_credential(channel)
     channel_id = channel_value(channel, "id")
+    password_enc = channel_value(channel, "password_enc", "")
 
     if credential.get("access_token"):
-        result = build_new_api_result(base_url, new_api_self(base_url, credential))
-        result["recharge_logs"] = safe_new_api_recharge_logs(base_url, credential)
-        return result
+        try:
+            result = build_new_api_result(base_url, new_api_self(base_url, credential))
+            result["recharge_logs"] = safe_new_api_recharge_logs(base_url, credential)
+            return result
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if not password_enc or not any(marker in message for marker in (
+                "unauthorized", "not logged in", "invalid access token", "登录",
+            )):
+                raise
 
-    password_enc = channel_value(channel, "password_enc", "")
     if not password_enc:
         raise RuntimeError("缺少可用令牌，请重新添加渠道")
     session, user = new_api_login(base_url, channel["username"], decrypt(password_enc))
@@ -1835,6 +1781,134 @@ def provision_channel(platform, base_url, username, password, totp_code=""):
         result["recharge_logs"] = safe_sub2api_recharge_logs(base_url, credential["access_token"])
         return credential, result
     raise RuntimeError(f"未知平台: {platform}")
+
+
+def persist_provisioned_channel(name, platform, base_url, username, password, credential, result,
+                                cny_rate=None, alert_cny=None, boss_recharge_required=False):
+    ts = now_iso()
+    cny_rate = rate_from(cny_rate)
+    alert_cny = alert_threshold_from(alert_cny)
+    with db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO channels(
+                name, platform, base_url, username, password_enc, credential_enc, cny_rate, alert_cny, enabled,
+                boss_recharge_required, balance, raw_balance, used_balance, raw_used_balance, request_count,
+                currency, status, message, raw_response, last_checked_at, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                platform,
+                normalize_url(base_url),
+                username,
+                encrypt(password),
+                encrypt(json.dumps(credential, ensure_ascii=False)),
+                as_float(cny_rate),
+                as_float(alert_cny),
+                1 if boss_recharge_required else 0,
+                as_float(result.get("balance")),
+                result.get("raw_balance"),
+                as_float(result.get("used_balance")),
+                result.get("raw_used_balance"),
+                result.get("request_count"),
+                result.get("currency", "USD"),
+                result.get("status", "ok"),
+                result.get("message", ""),
+                json.dumps(result.get("raw_response") or {}, ensure_ascii=False),
+                ts,
+                ts,
+                ts,
+            ),
+        )
+        row = conn.execute("SELECT * FROM channels WHERE id = ?", (cur.lastrowid,)).fetchone()
+        if row:
+            safe_sync_recharge_logs(conn, row, result.get("recharge_logs") or [])
+        record_balance_history(conn, cur.lastrowid, result, ts)
+        prune_history(conn)
+    return cur.lastrowid
+
+
+def sync_catalog_accounts(new_api_username, new_api_password, sub2api_username, sub2api_password,
+                          retry_failed=True):
+    candidates = catalog_account_candidates()
+    previous = {item["base_url"]: item for item in list_discovery_results()}
+    with db() as conn:
+        existing_rows = conn.execute("SELECT id, base_url, platform FROM channels").fetchall()
+    existing = {
+        normalize_url(row["base_url"]): {"id": row["id"], "platform": row["platform"]}
+        for row in existing_rows
+    }
+    summary = {"total": len(candidates), "existing": 0, "imported": 0, "failed": 0, "unknown": 0}
+
+    pending = []
+    for candidate in candidates:
+        current = existing.get(candidate["base_url"])
+        if candidate["base_url"] in list_catalog_exclusions():
+            summary.setdefault("excluded", 0)
+            summary["excluded"] += 1
+            continue
+        if current:
+            password = new_api_password if current["platform"] == "new_api" else sub2api_password
+            save_channel_password(current["id"], password)
+            save_discovery_result(
+                candidate, current["platform"], "existing", "已在余额监控中", current["id"]
+            )
+            summary["existing"] += 1
+        elif not retry_failed and candidate["base_url"] in previous:
+            state = previous[candidate["base_url"]].get("state")
+            if state in ("failed", "unknown"):
+                summary[state] += 1
+            else:
+                summary["failed"] += 1
+        else:
+            pending.append(candidate)
+
+    def inspect_and_login(candidate):
+        platform, message = detect_upstream_platform(candidate["base_url"])
+        if not platform:
+            return candidate, platform, "unknown", message, None, None, "", ""
+        accounts = [(sub2api_username, sub2api_password)] if platform == "sub2api" else [
+            (new_api_username, new_api_password),
+            (sub2api_username, sub2api_password),
+        ]
+        accounts = list(dict.fromkeys((username, password) for username, password in accounts if username and password))
+        if not accounts:
+            return candidate, platform, "failed", f"{message}，但未提供对应账密", None, None, "", ""
+        failures = []
+        for username, password in accounts:
+            try:
+                credential, result = provision_channel(platform, candidate["base_url"], username, password)
+                return candidate, platform, "ready", message, credential, result, username, password
+            except Exception as exc:
+                failures.append(str(exc))
+                if any(marker in str(exc).lower() for marker in ("turnstile", "verification", "2fa")):
+                    break
+        return candidate, platform, "failed", failures[-1], None, None, "", ""
+
+    max_workers = min(6, max(1, len(pending)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        inspected = list(executor.map(inspect_and_login, pending))
+
+    for candidate, platform, state, message, credential, result, used_username, used_password in inspected:
+        if state == "ready":
+            name = candidate["names"][0] if candidate.get("names") else candidate["base_url"]
+            try:
+                channel_id = persist_provisioned_channel(
+                    name, platform, candidate["base_url"], used_username, used_password, credential, result
+                )
+            except Exception as exc:
+                save_discovery_result(candidate, platform, "failed", exc)
+                summary["failed"] += 1
+                continue
+            save_discovery_result(candidate, platform, "imported", "登录成功并读取到真实余额", channel_id)
+            summary["imported"] += 1
+        else:
+            save_discovery_result(candidate, platform, state, message)
+            summary[state] += 1
+    summary["items"] = list_discovery_results()
+    return summary
 
 
 def get_new_api_quota_unit(base_url):
@@ -1969,6 +2043,7 @@ def refresh_all(send_notify=False):
                 persist_failure(row["id"], exc)
                 results.append(row_to_channel(get_channel(row["id"])))
         send_low_balance_alerts(results)
+        send_channel_error_alerts(results)
         if send_notify and setting_get("notify_enabled", "1") == "1":
             send_notification_summary(results)
         return results
@@ -2168,6 +2243,88 @@ def send_low_balance_alerts(channels):
     return sent
 
 
+def channel_error_alert_key(channel_id):
+    return f"channel_error_alerted_at:{channel_id}"
+
+
+def should_send_channel_error_alert(channel):
+    key = channel_error_alert_key(channel["id"])
+    if channel.get("status") != "error":
+        setting_delete(key)
+        return False
+    alerted_at = parse_iso_timestamp(setting_get(key))
+    if not alerted_at:
+        return True
+    return datetime.now(timezone.utc) - alerted_at >= timedelta(seconds=CHANNEL_ERROR_ALERT_COOLDOWN_SECONDS)
+
+
+def send_channel_error_alerts(channels):
+    if setting_get("notify_enabled", "1") != "1":
+        return []
+    sent = []
+    for channel in channels:
+        if not should_send_channel_error_alert(channel):
+            continue
+        content = "\n".join([
+            f"渠道名: {channel.get('name') or channel.get('base_url')}",
+            "状态: 余额读取失败",
+            f"原因: {str(channel.get('message') or '未知错误')[:300]}",
+            f"上游: {channel.get('base_url')}",
+        ])
+        notify_sent = post_notification_text(content) if notification_webhooks_configured() else []
+        email_sent = post_low_balance_email("上游余额读取失败", content)
+        if notify_sent or email_sent:
+            setting_set(channel_error_alert_key(channel["id"]), now_iso())
+            sent.append(channel)
+    return sent
+
+
+def catalog_balance_alert_key(catalog_id):
+    return f"catalog_balance_alerted_at:{catalog_id}"
+
+
+def send_catalog_balance_alerts(data):
+    if setting_get("notify_enabled", "1") != "1":
+        return []
+    sent = []
+    for channel in data.get("items", []):
+        if not channel.get("balance_configured") or not channel.get("present_in_source", True):
+            continue
+        balance = channel.get("estimated_balance")
+        threshold = channel.get("alert_balance")
+        if balance is None or threshold is None:
+            continue
+        key = catalog_balance_alert_key(channel["id"])
+        if balance > threshold:
+            setting_delete(key)
+            continue
+        alerted_at = parse_iso_timestamp(setting_get(key))
+        if alerted_at and datetime.now(timezone.utc) - alerted_at < timedelta(seconds=LOW_BALANCE_ALERT_COOLDOWN_SECONDS):
+            continue
+        content = "\n".join([
+            f"渠道名: {channel.get('alias') or channel.get('name')}",
+            f"账本余额: {format_money(balance)} USD",
+            f"告警线: {format_money(threshold)} USD",
+            f"本期扣减: {format_money(channel.get('spent_since_calibration'))} USD",
+            "来源: New API 小时消耗估算",
+        ])
+        notify_sent = post_notification_text(content) if notification_webhooks_configured() else []
+        email_sent = post_low_balance_email("渠道账本余额告警", content)
+        if notify_sent or email_sent:
+            setting_set(key, now_iso())
+            sent.append(channel)
+    return sent
+
+
+def refresh_channel_catalog(send_alerts=False):
+    with db() as conn:
+        changed = channel_catalog.sync_file(conn, CHANNEL_CATALOG_PATH)
+        data = channel_catalog.list_catalog(conn)
+    if changed and send_alerts:
+        send_catalog_balance_alerts(data)
+    return data, changed
+
+
 @app.get("/")
 def index():
     return send_from_directory(STATIC_DIR, "index.html")
@@ -2190,6 +2347,8 @@ def auth_bootstrap():
 
 @app.post("/api/auth/register")
 def auth_register():
+    if not ALLOW_ADMIN_REGISTRATION:
+        return response_error("管理员账号由服务器预设", 403)
     if user_count() > 0:
         return response_error("管理员账号已创建", 403)
     payload = request_payload(force=True)
@@ -2215,11 +2374,30 @@ def auth_login():
     payload = request_payload(force=True)
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
+    attempt_key = login_attempt_key(username)
+    with db() as conn:
+        retry_after = auth_security.retry_after(
+            conn, attempt_key, LOGIN_ATTEMPT_WINDOW_SECONDS
+        )
+    if retry_after:
+        return login_rate_limit_response(retry_after)
     row = get_user_by_username(username)
     if not row or not check_password_hash(row["password_hash"], password):
+        with db() as conn:
+            retry_after = auth_security.record_failure(
+                conn,
+                attempt_key,
+                LOGIN_MAX_FAILURES,
+                LOGIN_ATTEMPT_WINDOW_SECONDS,
+                LOGIN_LOCK_SECONDS,
+            )
+        if retry_after:
+            return login_rate_limit_response(retry_after)
         return response_error("账号或密码错误", 401)
     if row["totp_enabled"] and not verify_totp(row["totp_secret"], payload.get("totp")):
         return response_error("2FA 验证码错误", 401)
+    with db() as conn:
+        auth_security.clear_failures(conn, attempt_key)
     setup_login(row)
     return jsonify({"ok": True, "data": auth_state(row)})
 
@@ -2272,76 +2450,6 @@ def auth_2fa_disable():
 @login_required
 def get_settings():
     return jsonify({"ok": True, "data": public_settings()})
-
-
-@app.get("/api/opencode/accounts")
-@login_required
-def api_opencode_accounts():
-    force = request.args.get("refresh") == "1"
-    try:
-        accounts = load_opencode_accounts(force=force, reject_if_busy=True)
-    except OpenCodeRefreshBusy as exc:
-        return response_error(str(exc), 409)
-    return jsonify({"ok": True, "data": public_opencode_bundle(accounts), "fetched_at": now_iso()})
-
-
-@app.post("/api/opencode/accounts")
-@login_required
-def api_create_opencode_account():
-    try:
-        account = save_opencode_account(request_payload(force=True))
-    except ValueError as exc:
-        return response_error(str(exc))
-    return jsonify({"ok": True, "data": account})
-
-
-@app.put("/api/opencode/accounts/<int:account_id>")
-@login_required
-def api_update_opencode_account(account_id):
-    try:
-        account = save_opencode_account(request_payload(force=True), account_id=account_id)
-    except LookupError as exc:
-        return response_error(str(exc), 404)
-    except ValueError as exc:
-        return response_error(str(exc))
-    return jsonify({"ok": True, "data": account})
-
-
-@app.delete("/api/opencode/accounts/<int:account_id>")
-@login_required
-def api_delete_opencode_account(account_id):
-    if not get_opencode_account(account_id):
-        return response_error("OpenCode Go 账号不存在", 404)
-    with db() as conn:
-        conn.execute("DELETE FROM opencode_accounts WHERE id = ?", (account_id,))
-    clear_opencode_cache(account_id)
-    return jsonify({"ok": True})
-
-
-@app.post("/api/opencode/refresh")
-@login_required
-def api_refresh_opencode_accounts():
-    try:
-        accounts = load_opencode_accounts(force=True, reject_if_busy=True)
-    except OpenCodeRefreshBusy as exc:
-        return response_error(str(exc), 409)
-    return jsonify({"ok": True, "data": public_opencode_bundle(accounts), "fetched_at": now_iso()})
-
-
-@app.get("/api/opencode/alerts")
-@login_required
-def api_opencode_alerts():
-    return jsonify({"ok": True, "data": public_opencode_alert_status()})
-
-
-@app.post("/api/opencode/alerts/test")
-@login_required
-def api_test_opencode_alerts():
-    if not opencode_notifications_enabled():
-        return response_error("请先配置企业微信、飞书或低余额邮箱")
-    if not deliver_opencode_event({"type": "test"}):
-        return response_error("OpenCode Go 告警测试发送失败", 502)
-    return jsonify({"ok": True})
 
 
 @app.put("/api/settings")
@@ -2422,6 +2530,141 @@ def api_list_channels():
     return jsonify({"ok": True, "data": list_channels()})
 
 
+@app.get("/api/catalog")
+@login_required
+def api_catalog():
+    try:
+        data, _ = refresh_channel_catalog()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"[catalog-sync] ignored invalid catalog: {exc}", flush=True)
+        with db() as conn:
+            data = channel_catalog.list_catalog(conn)
+    return jsonify({"ok": True, "data": data})
+
+
+@app.post("/api/catalog/sync")
+@login_required
+def api_catalog_sync():
+    if not CHANNEL_CATALOG_PATH.exists():
+        return response_error("还没有收到备份渠道清单", 404)
+    try:
+        data, changed = refresh_channel_catalog(send_alerts=True)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return response_error(f"渠道清单不可用: {exc}")
+    data["changed"] = changed
+    return jsonify({"ok": True, "data": data})
+
+
+@app.get("/api/catalog/accounts")
+@login_required
+def api_catalog_accounts():
+    candidates = catalog_account_candidates()
+    items = list_discovery_results()
+    return jsonify({
+        "ok": True,
+        "data": {
+            "source_count": len(candidates),
+            "items": items,
+        },
+    })
+
+
+@app.get("/api/routes")
+@login_required
+def api_routes():
+    try:
+        data = list_catalog_routes()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return response_error(f"读取渠道备份失败: {exc}", 400)
+    return jsonify({"ok": True, "data": data})
+
+
+@app.post("/api/routes/exclude")
+@login_required
+def api_exclude_route():
+    payload = request_payload(force=True)
+    try:
+        exclude_catalog_address(payload.get("base_url"), payload.get("reason") or "手动移除")
+        return jsonify({"ok": True, "data": list_catalog_routes()})
+    except ValueError as exc:
+        return response_error(str(exc))
+
+
+@app.post("/api/routes/restore")
+@login_required
+def api_restore_route():
+    payload = request_payload(force=True)
+    try:
+        restore_catalog_address(payload.get("base_url"))
+        return jsonify({"ok": True, "data": list_catalog_routes()})
+    except ValueError as exc:
+        return response_error(str(exc))
+
+
+@app.post("/api/catalog/accounts/sync")
+@login_required
+def api_catalog_accounts_sync():
+    payload = request_payload(force=True)
+    new_api_username = str(payload.get("new_api_username") or "").strip()
+    new_api_password = payload.get("new_api_password") or ""
+    sub2api_username = str(payload.get("sub2api_username") or "").strip()
+    sub2api_password = payload.get("sub2api_password") or ""
+    try:
+        data = sync_catalog_accounts(
+            new_api_username,
+            new_api_password,
+            sub2api_username,
+            sub2api_password,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return response_error(f"读取渠道备份失败: {exc}", 400)
+    save_catalog_sync_credentials(
+        new_api_username, new_api_password, sub2api_username, sub2api_password
+    )
+    return jsonify({"ok": True, "data": data})
+
+
+@app.post("/api/catalog/channels")
+@login_required
+def api_catalog_create():
+    try:
+        with db() as conn:
+            catalog_id = channel_catalog.create_manual(conn, request_payload(force=True))
+            data = channel_catalog.list_catalog(conn)
+    except ValueError as exc:
+        return response_error(str(exc))
+    data["created_id"] = catalog_id
+    return jsonify({"ok": True, "data": data})
+
+
+@app.put("/api/catalog/channels/<int:catalog_id>")
+@login_required
+def api_catalog_update(catalog_id):
+    try:
+        with db() as conn:
+            channel_catalog.update_local_fields(conn, catalog_id, request_payload(force=True))
+            data = channel_catalog.list_catalog(conn)
+    except LookupError as exc:
+        return response_error(str(exc), 404)
+    except ValueError as exc:
+        return response_error(str(exc))
+    return jsonify({"ok": True, "data": data})
+
+
+@app.delete("/api/catalog/channels/<int:catalog_id>")
+@login_required
+def api_catalog_delete(catalog_id):
+    try:
+        with db() as conn:
+            channel_catalog.delete_manual(conn, catalog_id)
+            data = channel_catalog.list_catalog(conn)
+    except LookupError as exc:
+        return response_error(str(exc), 404)
+    except ValueError as exc:
+        return response_error(str(exc))
+    return jsonify({"ok": True, "data": data})
+
+
 @app.get("/api/recharges")
 @login_required
 def api_recharge_logs():
@@ -2468,13 +2711,14 @@ def api_create_channel():
                 boss_recharge_required, balance, raw_balance, used_balance, raw_used_balance, request_count,
                 currency, status, message, raw_response, last_checked_at, created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
                 platform,
                 base_url,
                 username,
+                encrypt(password),
                 encrypt(json.dumps(credential, ensure_ascii=False)),
                 as_float(cny_rate),
                 as_float(alert_cny),
@@ -2540,7 +2784,7 @@ def api_update_channel(channel_id):
                     platform = ?,
                     base_url = ?,
                     username = ?,
-                    password_enc = '',
+                    password_enc = ?,
                     credential_enc = ?,
                     cny_rate = ?,
                     alert_cny = ?,
@@ -2564,6 +2808,7 @@ def api_update_channel(channel_id):
                     platform,
                     base_url,
                     username,
+                    encrypt(password),
                     credential_enc,
                     as_float(cny_rate),
                     as_float(alert_cny),
@@ -2597,7 +2842,6 @@ def api_update_channel(channel_id):
                     base_url = ?,
                     username = ?,
                     credential_enc = ?,
-                    password_enc = '',
                     cny_rate = ?,
                     alert_cny = ?,
                     enabled = ?,
@@ -2661,20 +2905,32 @@ def register_api_aliases():
 
 
 def scheduler_loop():
-    last_notify_at = 0.0
-    last_opencode_alert_at = 0.0
+    last_catalog_sync = 0.0
+    last_catalog_account_sync = 0.0
+    last_account_refresh = 0.0
+    tick_seconds = min(30, CATALOG_SYNC_INTERVAL_SECONDS, REFRESH_INTERVAL_SECONDS)
     while True:
-        time.sleep(REFRESH_INTERVAL_SECONDS)
-        try:
-            should_notify = time.time() - last_notify_at >= NOTIFY_INTERVAL_SECONDS
-            refresh_all(send_notify=should_notify)
-            if should_notify:
-                last_notify_at = time.time()
-        except Exception as exc:
-            print(f"[scheduler] refresh failed: {exc}", flush=True)
-        if time.time() - last_opencode_alert_at >= OPENCODE_GO_ALERT_INTERVAL_SECONDS:
-            run_opencode_alert_monitor()
-            last_opencode_alert_at = time.time()
+        time.sleep(tick_seconds)
+        current = time.monotonic()
+        if current - last_catalog_sync >= CATALOG_SYNC_INTERVAL_SECONDS:
+            try:
+                refresh_channel_catalog(send_alerts=True)
+            except Exception as exc:
+                print(f"[catalog-scheduler] sync failed: {exc}", flush=True)
+            last_catalog_sync = current
+        account_sync_enabled = CATALOG_ACCOUNT_SYNC_ENABLED or setting_get("catalog_account_sync_enabled", "0") == "1"
+        if account_sync_enabled and current - last_catalog_account_sync >= CATALOG_ACCOUNT_SYNC_INTERVAL_SECONDS:
+            try:
+                sync_catalog_accounts(*catalog_sync_credentials(), retry_failed=False)
+            except Exception as exc:
+                print(f"[catalog-account-scheduler] sync failed: {exc}", flush=True)
+            last_catalog_account_sync = current
+        if ACCOUNT_REFRESH_ENABLED and current - last_account_refresh >= REFRESH_INTERVAL_SECONDS:
+            try:
+                refresh_all(send_notify=False)
+            except Exception as exc:
+                print(f"[balance-scheduler] refresh failed: {exc}", flush=True)
+            last_account_refresh = current
 
 
 def start_scheduler():
@@ -2683,7 +2939,6 @@ def start_scheduler():
 
 
 init_db()
-import_opencode_accounts()
 register_api_aliases()
 start_scheduler()
 

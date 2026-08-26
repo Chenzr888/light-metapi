@@ -18,10 +18,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY app.py ./app.py
-COPY opencode_go.py ./opencode_go.py
+COPY auth_security.py channel_catalog.py ./
+COPY scripts/set-admin-password.py ./scripts/set-admin-password.py
 COPY static ./static
-RUN chmod 755 /app /app/static \
-    && chmod 644 /app/app.py /app/opencode_go.py \
+RUN chmod 755 /app /app/static /app/scripts \
+    && chmod 644 /app/app.py /app/auth_security.py /app/channel_catalog.py /app/scripts/set-admin-password.py \
     && find /app/static -type d -exec chmod 755 {} + \
     && find /app/static -type f -exec chmod 644 {} +
 
