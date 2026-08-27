@@ -5,7 +5,6 @@ umask 077
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 REPO=Chenzr888/light-metapi
 HOST=cy16
-IMPORT_FILE=""
 CONFIRM=""
 SHA_INPUT=""
 PLAN_ONLY=0
@@ -15,8 +14,8 @@ OFFSITE_DIR=${UPSTREAM_BALANCE_OFFSITE_DIR:-$HOME/ai/api/.backups/upstream-balan
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/deploy-cy16.sh --sha <full-or-short-sha> --confirm cy16:<sha12> [--import-opencode <config.json>]
-  scripts/deploy-cy16.sh --sha <full-or-short-sha> --plan [--import-opencode <config.json>]
+  scripts/deploy-cy16.sh --sha <full-or-short-sha> --confirm cy16:<sha12>
+  scripts/deploy-cy16.sh --sha <full-or-short-sha> --plan
 
 Only a clean, locally verified origin/main commit with a successful GitHub CI run can deploy.
 EOF
@@ -26,7 +25,6 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --sha) SHA_INPUT=${2:?missing value for --sha}; shift ;;
     --confirm) CONFIRM=${2:?missing value for --confirm}; shift ;;
-    --import-opencode) IMPORT_FILE=${2:?missing value for --import-opencode}; shift ;;
     --plan) PLAN_ONLY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "FATAL: unknown argument: $1" >&2; usage; exit 1 ;;
@@ -55,21 +53,6 @@ RELEASE_SHA=$(git rev-parse --verify "$SHA_INPUT^{commit}")
 
 SHORT_SHA=${RELEASE_SHA:0:12}
 IMAGE_REF="ghcr.io/chenzr888/light-metapi:sha-$RELEASE_SHA"
-EXPECTED_OPENCODE=preserve
-if [ -n "$IMPORT_FILE" ]; then
-  IMPORT_FILE=$(readlink -f "$IMPORT_FILE")
-  [ -f "$IMPORT_FILE" ] || { echo "FATAL: import file not found" >&2; exit 1; }
-  [ "$(stat -c '%a' "$IMPORT_FILE")" = "600" ] || { echo "FATAL: import file must have mode 600" >&2; exit 1; }
-  EXPECTED_OPENCODE=$(python3 - "$IMPORT_FILE" <<'PY'
-import json, sys
-payload = json.load(open(sys.argv[1], encoding="utf-8"))
-accounts = payload.get("accounts") if isinstance(payload, dict) else None
-if not isinstance(accounts, list) or not accounts:
-    raise SystemExit("invalid or empty accounts payload")
-print(len(accounts))
-PY
-)
-fi
 
 RUN_JSON=$(gh run list --repo "$REPO" --workflow ci.yml --commit "$RELEASE_SHA" --limit 1 \
   --json databaseId,status,conclusion,headSha,url)
@@ -92,7 +75,6 @@ echo "DEPLOY_PLAN"
 echo "  host=$HOST"
 echo "  sha=$RELEASE_SHA"
 echo "  image=$IMAGE_REF"
-echo "  expected_opencode=$EXPECTED_OPENCODE"
 echo "  scope=upstream-balance container only; nginx/light-proxy/new-api unchanged"
 
 if [ "$PLAN_ONLY" = "1" ]; then
@@ -115,14 +97,10 @@ RELEASE_DIR="/home/ubuntu/upstream-balance/releases/$RELEASE_SHA/$ATTEMPT_ID"
 ssafe "$HOST" "mkdir -p '$RELEASE_PARENT' && chmod 700 '$RELEASE_PARENT' && mkdir '$RELEASE_DIR' && mkdir '$RELEASE_DIR/deploy' '$RELEASE_DIR/scripts' && chmod 700 '$RELEASE_DIR' '$RELEASE_DIR/deploy' '$RELEASE_DIR/scripts'"
 
 PACKAGE_DIR=$(mktemp -d /tmp/light-metapi-release.XXXXXX)
-REMOTE_IMPORT=""
 REMOTE_IMAGE_ARCHIVE=""
 TASK_ACCEPTED=0
 cleanup() {
   if [ "$TASK_ACCEPTED" = "0" ]; then
-    if [ -n "$REMOTE_IMPORT" ]; then
-      ssafe "$HOST" "find '$REMOTE_IMPORT' -maxdepth 0 -type f -delete 2>/dev/null || true" >/dev/null 2>&1 || true
-    fi
     if [ -n "$REMOTE_IMAGE_ARCHIVE" ]; then
       ssafe "$HOST" "find '$REMOTE_IMAGE_ARCHIVE' -maxdepth 0 -type f -delete 2>/dev/null || true" >/dev/null 2>&1 || true
     fi
@@ -258,12 +236,6 @@ REMOTE_IMAGE_ARCHIVE="$RELEASE_DIR/light-metapi-image.tar.gz"
 scpsafe "$IMAGE_ARCHIVE" "$HOST:$REMOTE_IMAGE_ARCHIVE"
 ssafe "$HOST" "chmod 600 '$REMOTE_IMAGE_ARCHIVE'"
 
-if [ -n "$IMPORT_FILE" ]; then
-  REMOTE_IMPORT="$RELEASE_DIR/opencode-import.json"
-  scpsafe "$IMPORT_FILE" "$HOST:$REMOTE_IMPORT"
-  ssafe "$HOST" "chmod 600 '$REMOTE_IMPORT'"
-fi
-
 notify() {
   local status=$1 title=$2 detail=$3
   [ -x "$NOTIFY" ] || return 0
@@ -281,8 +253,7 @@ ssafe "$HOST" "command -v nohup >/dev/null && command -v setsid >/dev/null"
 ssafe "$HOST" \
   "nohup setsid env RELEASE_SHA='$RELEASE_SHA' IMAGE_REF='$IMAGE_REF' \
     IMAGE_ARCHIVE='$REMOTE_IMAGE_ARCHIVE' IMAGE_ARCHIVE_SHA256='$IMAGE_ARCHIVE_SHA256' \
-    RELEASE_DIR='$RELEASE_DIR' IMPORT_FILE='$REMOTE_IMPORT' \
-    EXPECTED_OPENCODE='$EXPECTED_OPENCODE' ATTEMPT_ID='$ATTEMPT_ID' \
+    RELEASE_DIR='$RELEASE_DIR' ATTEMPT_ID='$ATTEMPT_ID' \
     /bin/bash '$RELEASE_DIR/scripts/remote-run-cy16.sh' \
     > '$LAUNCH_LOG' 2>&1 < /dev/null & printf '%s\n' \$! > '$PID_FILE'"
 TASK_ACCEPTED=1

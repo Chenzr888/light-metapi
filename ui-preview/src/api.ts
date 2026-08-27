@@ -1,18 +1,4 @@
-import type {
-  AuthState,
-  Channel,
-  DraftChannel,
-  OpenCodeAccount,
-  OpenCodeAlertStatus,
-  OpenCodeBundle,
-  OpenCodeDraft,
-  OpenCodePool,
-  OpenCodePoolWindow,
-  OpenCodeWindow,
-  Platform,
-  RechargeLog,
-  SettingsState,
-} from "./types";
+import type { AuthState, CatalogData, CatalogDraft, Channel, DraftChannel, Platform, RechargeLog, RouteData, SettingsState } from "./types";
 
 interface ApiEnvelope<T> {
   ok?: boolean;
@@ -70,79 +56,6 @@ interface RawRechargeLog {
   detected_at: string;
   source_status?: string;
   source_type?: string;
-}
-
-interface RawOpenCodeWindow {
-  key: string;
-  label: string;
-  used_percent: number;
-  remaining_percent: number;
-  reset_in_seconds: number;
-  resets_at: string;
-}
-
-interface RawOpenCodeAccount {
-  id: number;
-  account_key: string;
-  label: string;
-  workspace_id: string | null;
-  quota_configured: boolean;
-  models_configured: boolean;
-  has_auth_cookie: boolean;
-  has_api_key: boolean;
-  api_key_hint: string | null;
-  enabled: boolean;
-  quota: null | {
-    windows: Record<string, RawOpenCodeWindow>;
-    fetched_at: string;
-    cache?: { status: string; age_seconds: number; warning?: string };
-  };
-  quota_error: null | { code: string; message: string };
-  models: null | {
-    count: number;
-    key_valid: boolean;
-    upstream_state: string;
-    fetched_at: string;
-    cache?: { status: string; age_seconds: number; warning?: string };
-  };
-  models_error: null | { code: string; message: string };
-}
-
-interface RawOpenCodePoolWindow {
-  key: string;
-  label: string;
-  cap_usd: number;
-  used_usd: number;
-  remaining_usd: number;
-  total_usd: number;
-  used_percent: number | null;
-  remaining_percent: number | null;
-  samples: number;
-  account_count: number;
-  alert_threshold_usd: number;
-  below_threshold: boolean;
-}
-
-interface RawOpenCodePool {
-  windows: Record<string, RawOpenCodePoolWindow>;
-  fetched_at: string;
-}
-
-interface RawOpenCodeBundle {
-  accounts: RawOpenCodeAccount[];
-  pool: RawOpenCodePool;
-}
-
-interface RawOpenCodeAlertStatus {
-  enabled: boolean;
-  running: boolean;
-  interval_seconds: number;
-  thresholds: number[];
-  pool_thresholds_usd?: Record<string, number>;
-  last_run_at: string | null;
-  last_success_at: string | null;
-  last_error: string | null;
-  delivered_events: number;
 }
 
 const apiBase = new URL(".", window.location.href).pathname.replace(/\/$/, "");
@@ -233,6 +146,7 @@ function mapChannel(raw: RawChannel): Channel {
   };
 }
 
+
 function mapRecharge(raw: RawRechargeLog): RechargeLog {
   return {
     id: raw.id,
@@ -241,112 +155,6 @@ function mapRecharge(raw: RawRechargeLog): RechargeLog {
     amountCny: raw.amount_cny,
     detectedAt: raw.detected_at,
     source: raw.source_type || raw.source_status || "-",
-  };
-}
-
-function mapOpenCodeWindow(raw: RawOpenCodeWindow): OpenCodeWindow {
-  return {
-    key: raw.key,
-    label: raw.label,
-    usedPercent: raw.used_percent,
-    remainingPercent: raw.remaining_percent,
-    resetInSeconds: raw.reset_in_seconds,
-    resetsAt: raw.resets_at,
-  };
-}
-
-function mapOpenCodePoolWindow(raw: RawOpenCodePoolWindow): OpenCodePoolWindow {
-  return {
-    key: raw.key,
-    label: raw.label,
-    capUsd: raw.cap_usd,
-    usedUsd: raw.used_usd,
-    remainingUsd: raw.remaining_usd,
-    totalUsd: raw.total_usd,
-    usedPercent: raw.used_percent,
-    remainingPercent: raw.remaining_percent,
-    samples: raw.samples,
-    accountCount: raw.account_count,
-    alertThresholdUsd: raw.alert_threshold_usd,
-    belowThreshold: raw.below_threshold,
-  };
-}
-
-function mapOpenCodePool(raw: RawOpenCodePool | null | undefined): OpenCodePool | null {
-  if (!raw) return null;
-  return {
-    windows: Object.fromEntries(
-      Object.entries(raw.windows || {}).map(([key, value]) => [key, mapOpenCodePoolWindow(value)]),
-    ),
-    fetchedAt: raw.fetched_at,
-  };
-}
-
-function mapOpenCodeAccount(raw: RawOpenCodeAccount): OpenCodeAccount {
-  const windows = Object.fromEntries(
-    Object.entries(raw.quota?.windows || {}).map(([key, value]) => [key, mapOpenCodeWindow(value)]),
-  );
-  return {
-    id: raw.id,
-    accountKey: raw.account_key,
-    label: raw.label,
-    workspaceId: raw.workspace_id,
-    quotaConfigured: raw.quota_configured,
-    modelsConfigured: raw.models_configured,
-    hasAuthCookie: raw.has_auth_cookie,
-    hasApiKey: raw.has_api_key,
-    apiKeyHint: raw.api_key_hint,
-    enabled: raw.enabled,
-    quota: raw.quota ? {
-      windows,
-      fetchedAt: raw.quota.fetched_at,
-      cache: raw.quota.cache ? {
-        status: raw.quota.cache.status,
-        ageSeconds: raw.quota.cache.age_seconds,
-        warning: raw.quota.cache.warning,
-      } : undefined,
-    } : null,
-    quotaError: raw.quota_error,
-    models: raw.models ? {
-      count: raw.models.count,
-      keyValid: raw.models.key_valid,
-      upstreamState: raw.models.upstream_state,
-      fetchedAt: raw.models.fetched_at,
-      cache: raw.models.cache ? {
-        status: raw.models.cache.status,
-        ageSeconds: raw.models.cache.age_seconds,
-        warning: raw.models.cache.warning,
-      } : undefined,
-    } : null,
-    modelsError: raw.models_error,
-  };
-}
-
-function mapOpenCodeBundle(raw: RawOpenCodeBundle | RawOpenCodeAccount[]): OpenCodeBundle {
-  if (Array.isArray(raw)) {
-    return { accounts: raw.map(mapOpenCodeAccount), pool: null };
-  }
-  return {
-    accounts: (raw.accounts || []).map(mapOpenCodeAccount),
-    pool: mapOpenCodePool(raw.pool),
-  };
-}
-
-function mapOpenCodeAlerts(raw: RawOpenCodeAlertStatus): OpenCodeAlertStatus {
-  return {
-    enabled: raw.enabled,
-    running: raw.running,
-    intervalSeconds: raw.interval_seconds,
-    thresholds: raw.thresholds,
-    poolThresholdsUsd: raw.pool_thresholds_usd || {
-      rolling: 20,
-      weekly: 80,
-      monthly: 300,
-    },
-    lastRunAt: raw.last_run_at,
-    lastSuccessAt: raw.last_success_at,
-    lastError: raw.last_error,
-    deliveredEvents: raw.delivered_events,
   };
 }
 
@@ -409,45 +217,64 @@ export async function loadChannels() {
   return (await request<RawChannel[]>("/api/channels")).map(mapChannel);
 }
 
+interface RawRouteData {
+  items: Array<{
+    id: number; route_ids: number[]; route_names?: string[]; name: string; route_status: number | null; base_url: string;
+    group: string; models: string[]; platform: Platform | null;
+    monitor: RawChannel | null; discovery_state: string; discovery_message: string;
+  }>;
+  generated_at: string | null;
+  summary: { routes: number; addresses: number; monitored_addresses: number; pending_addresses: number; excluded_addresses?: number };
+}
+
+export async function loadRoutes(): Promise<RouteData> {
+  const raw = await request<RawRouteData>("/api/routes");
+  return mapRouteData(raw);
+}
+
+function mapRouteData(raw: RawRouteData): RouteData {
+  return {
+    items: raw.items.map((item) => ({
+      id: item.id,
+      routeIds: item.route_ids || [item.id],
+      routeNames: item.route_names || [],
+      name: item.name,
+      routeStatus: item.route_status,
+      baseUrl: item.base_url,
+      groupName: item.group,
+      models: item.models || [],
+      platform: item.platform,
+      monitor: item.monitor ? mapChannel(item.monitor) : null,
+      discoveryState: item.discovery_state,
+      discoveryMessage: item.discovery_message,
+    })),
+    generatedAt: raw.generated_at,
+    summary: {
+      routes: raw.summary.routes,
+      addresses: raw.summary.addresses,
+      monitoredAddresses: raw.summary.monitored_addresses,
+      pendingAddresses: raw.summary.pending_addresses,
+      excludedAddresses: raw.summary.excluded_addresses || 0,
+    },
+  };
+}
+
+export async function excludeRoute(baseUrl: string, reason = "手动移除") {
+  const raw = await request<RawRouteData>("/api/routes/exclude", {
+    method: "POST", body: JSON.stringify({ base_url: baseUrl, reason }),
+  });
+  return mapRouteData(raw);
+}
+
+export async function restoreRoute(baseUrl: string) {
+  const raw = await request<RawRouteData>("/api/routes/restore", {
+    method: "POST", body: JSON.stringify({ base_url: baseUrl }),
+  });
+  return mapRouteData(raw);
+}
+
 export async function loadRecharges(limit = 80) {
   return (await request<RawRechargeLog[]>(`/api/recharges?limit=${limit}`)).map(mapRecharge);
-}
-
-export async function loadOpenCodeAccounts(force = false) {
-  const suffix = force ? "?refresh=1" : "";
-  return mapOpenCodeBundle(await request<RawOpenCodeBundle | RawOpenCodeAccount[]>(`/api/opencode/accounts${suffix}`));
-}
-
-export async function refreshOpenCodeAccounts() {
-  return mapOpenCodeBundle(await request<RawOpenCodeBundle | RawOpenCodeAccount[]>("/api/opencode/refresh", {
-    method: "POST",
-    body: "{}",
-  }));
-}
-
-export async function loadOpenCodeAlerts() {
-  return mapOpenCodeAlerts(await request<RawOpenCodeAlertStatus>("/api/opencode/alerts"));
-}
-
-export async function saveOpenCodeAccount(draft: OpenCodeDraft, accountId?: number) {
-  const path = accountId ? `/api/opencode/accounts/${accountId}` : "/api/opencode/accounts";
-  return mapOpenCodeAccount(await request<RawOpenCodeAccount>(path, {
-    method: accountId ? "PUT" : "POST",
-    body: JSON.stringify({
-      label: draft.label,
-      workspace_id: draft.workspaceId,
-      auth_cookie: draft.authCookie,
-      api_key: draft.apiKey,
-    }),
-  }));
-}
-
-export async function deleteOpenCodeAccount(accountId: number) {
-  await request<unknown>(`/api/opencode/accounts/${accountId}`, { method: "DELETE", body: "{}" });
-}
-
-export async function testOpenCodeAlerts() {
-  await request<unknown>("/api/opencode/alerts/test", { method: "POST", body: "{}" });
 }
 
 export async function createChannel(draft: DraftChannel) {
@@ -457,6 +284,7 @@ export async function createChannel(draft: DraftChannel) {
     base_url: draft.baseUrl,
     username: draft.username,
     password: draft.password,
+    access_token: draft.accessToken || "",
     totp: draft.totp,
     cny_rate: draft.cnyRate,
     alert_cny: draft.thresholdCny,
@@ -502,4 +330,116 @@ export async function refreshAllChannels(notify: boolean) {
     method: "POST",
     body: JSON.stringify({ notify }),
   })).map(mapChannel);
+}
+
+export interface AccountSyncResult {
+  total: number;
+  existing: number;
+  imported: number;
+  failed: number;
+  unknown: number;
+}
+
+export async function syncCatalogAccounts(payload: {
+  newApiUsername: string;
+  newApiPassword: string;
+  sub2apiUsername: string;
+  sub2apiPassword: string;
+}) {
+  return request<AccountSyncResult>("/api/catalog/accounts/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      new_api_username: payload.newApiUsername,
+      new_api_password: payload.newApiPassword,
+      sub2api_username: payload.sub2apiUsername,
+      sub2api_password: payload.sub2apiPassword,
+    }),
+  });
+}
+
+interface RawCatalogData {
+  items: Array<{
+    id: number; source_kind: "backup" | "manual"; source: string; source_id: string;
+    name: string; alias: string; channel_type: number | null; status: number | null;
+    base_url: string; models: string[]; group_name: string; priority: number | null;
+    weight: number | null; balance: number | null; response_time: number | null;
+    source_tag: string; remark: string; owner: string; note: string; local_tags: string;
+    present_in_source: boolean; synced_at: string | null;
+    used_quota: number; quota_per_unit: number; ledger_balance: number | null;
+    ledger_calibrated_at: string | null; alert_balance: number; balance_currency: string;
+    balance_configured: boolean; spent_since_calibration: number; estimated_balance: number | null;
+  }>;
+  syncs: Array<{ source: string; generated_at: string; synced_at: string; item_count: number }>;
+  summary: Omit<CatalogData["summary"], "lowBalance" | "estimatedTotal" | "unmonitored"> & {
+    low_balance: number; estimated_total: number; unmonitored: number;
+  };
+  changed?: boolean;
+  created_id?: number;
+}
+
+function mapCatalog(raw: RawCatalogData): CatalogData {
+  return {
+    items: raw.items.map((item) => ({
+      id: item.id, sourceKind: item.source_kind, source: item.source, sourceId: item.source_id,
+      name: item.name, alias: item.alias, channelType: item.channel_type, status: item.status,
+      baseUrl: item.base_url, models: item.models || [], groupName: item.group_name,
+      priority: item.priority, weight: item.weight, balance: item.balance,
+      responseTime: item.response_time, sourceTag: item.source_tag, remark: item.remark,
+      owner: item.owner, note: item.note, localTags: item.local_tags,
+      presentInSource: item.present_in_source, syncedAt: item.synced_at,
+      usedQuota: item.used_quota, quotaPerUnit: item.quota_per_unit,
+      ledgerBalance: item.ledger_balance, ledgerCalibratedAt: item.ledger_calibrated_at,
+      alertBalance: item.alert_balance, balanceCurrency: item.balance_currency,
+      balanceConfigured: item.balance_configured,
+      spentSinceCalibration: item.spent_since_calibration,
+      estimatedBalance: item.estimated_balance,
+    })),
+    syncs: raw.syncs.map((item) => ({
+      source: item.source, generatedAt: item.generated_at,
+      syncedAt: item.synced_at, itemCount: item.item_count,
+    })),
+    summary: {
+      ...raw.summary,
+      lowBalance: raw.summary.low_balance,
+      estimatedTotal: raw.summary.estimated_total,
+      unmonitored: raw.summary.unmonitored,
+    },
+    changed: raw.changed,
+    createdId: raw.created_id,
+  };
+}
+
+export async function loadCatalog() {
+  return mapCatalog(await request<RawCatalogData>("/api/catalog"));
+}
+
+export async function syncCatalog() {
+  return mapCatalog(await request<RawCatalogData>("/api/catalog/sync", { method: "POST", body: "{}" }));
+}
+
+export async function createCatalogChannel(draft: CatalogDraft) {
+  return mapCatalog(await request<RawCatalogData>("/api/catalog/channels", {
+    method: "POST",
+    body: JSON.stringify({
+      name: draft.name, base_url: draft.baseUrl, group: draft.group, models: draft.models,
+      owner: draft.owner, note: draft.note, tags: draft.tags, status: draft.status,
+      ledger_balance: draft.ledgerBalance, alert_balance: draft.alertBalance,
+    }),
+  }));
+}
+
+export async function updateCatalogChannel(id: number, draft: CatalogDraft) {
+  return mapCatalog(await request<RawCatalogData>(`/api/catalog/channels/${id}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      name: draft.name, alias: draft.alias, base_url: draft.baseUrl, group: draft.group,
+      models: draft.models, owner: draft.owner, note: draft.note, tags: draft.tags,
+      status: draft.status,
+      ledger_balance: draft.ledgerBalance, alert_balance: draft.alertBalance,
+    }),
+  }));
+}
+
+export async function deleteCatalogChannel(id: number) {
+  return mapCatalog(await request<RawCatalogData>(`/api/catalog/channels/${id}`, { method: "DELETE" }));
 }

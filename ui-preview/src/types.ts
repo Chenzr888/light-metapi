@@ -20,6 +20,33 @@ export interface Channel {
   history: number[];
 }
 
+export interface RouteChannel {
+  id: number;
+  routeIds: number[];
+  routeNames?: string[];
+  name: string;
+  routeStatus: number | null;
+  baseUrl: string;
+  groupName: string;
+  models: string[];
+  platform: Platform | null;
+  monitor: Channel | null;
+  discoveryState: string;
+  discoveryMessage: string;
+}
+
+export interface RouteData {
+  items: RouteChannel[];
+  generatedAt: string | null;
+  summary: {
+    routes: number;
+    addresses: number;
+    monitoredAddresses: number;
+    pendingAddresses: number;
+    excludedAddresses?: number;
+  };
+}
+
 export interface RechargeLog {
   id: number;
   channelName: string;
@@ -35,6 +62,7 @@ export interface DraftChannel {
   baseUrl: string;
   username: string;
   password: string;
+  accessToken?: string;
   totp: string;
   cnyRate: string;
   thresholdCny: string;
@@ -59,87 +87,75 @@ export interface SettingsState {
   refreshIntervalSeconds: number;
 }
 
-export interface OpenCodeWindow {
-  key: string;
-  label: string;
-  usedPercent: number;
-  remainingPercent: number;
-  resetInSeconds: number;
-  resetsAt: string;
-}
+export type CatalogSourceKind = "backup" | "manual";
 
-export interface OpenCodePoolWindow {
-  key: string;
-  label: string;
-  capUsd: number;
-  usedUsd: number;
-  remainingUsd: number;
-  totalUsd: number;
-  usedPercent: number | null;
-  remainingPercent: number | null;
-  samples: number;
-  accountCount: number;
-  alertThresholdUsd: number;
-  belowThreshold: boolean;
-}
-
-export interface OpenCodePool {
-  windows: Record<string, OpenCodePoolWindow>;
-  fetchedAt: string;
-}
-
-export interface OpenCodeErrorState {
-  code: string;
-  message: string;
-}
-
-export interface OpenCodeAccount {
+export interface CatalogChannel {
   id: number;
-  accountKey: string;
-  label: string;
-  workspaceId: string | null;
-  quotaConfigured: boolean;
-  modelsConfigured: boolean;
-  hasAuthCookie: boolean;
-  hasApiKey: boolean;
-  apiKeyHint: string | null;
-  enabled: boolean;
-  quota: {
-    windows: Record<string, OpenCodeWindow>;
-    fetchedAt: string;
-    cache?: { status: string; ageSeconds: number; warning?: string };
-  } | null;
-  quotaError: OpenCodeErrorState | null;
-  models: {
-    count: number;
-    keyValid: boolean;
-    upstreamState: string;
-    fetchedAt: string;
-    cache?: { status: string; ageSeconds: number; warning?: string };
-  } | null;
-  modelsError: OpenCodeErrorState | null;
+  sourceKind: CatalogSourceKind;
+  source: string;
+  sourceId: string;
+  name: string;
+  alias: string;
+  channelType: number | null;
+  status: number | null;
+  baseUrl: string;
+  models: string[];
+  groupName: string;
+  priority: number | null;
+  weight: number | null;
+  balance: number | null;
+  responseTime: number | null;
+  sourceTag: string;
+  remark: string;
+  owner: string;
+  note: string;
+  localTags: string;
+  presentInSource: boolean;
+  syncedAt: string | null;
+  usedQuota: number;
+  quotaPerUnit: number;
+  ledgerBalance: number | null;
+  ledgerCalibratedAt: string | null;
+  alertBalance: number;
+  balanceCurrency: string;
+  balanceConfigured: boolean;
+  spentSinceCalibration: number;
+  estimatedBalance: number | null;
 }
 
-export interface OpenCodeBundle {
-  accounts: OpenCodeAccount[];
-  pool: OpenCodePool | null;
+export interface CatalogData {
+  items: CatalogChannel[];
+  syncs: Array<{
+    source: string;
+    generatedAt: string;
+    syncedAt: string;
+    itemCount: number;
+  }>;
+  summary: {
+    total: number;
+    synced: number;
+    manual: number;
+    disabled: number;
+    missing: number;
+    monitored: number;
+    unmonitored: number;
+    lowBalance: number;
+    estimatedTotal: number;
+  };
+  changed?: boolean;
+  createdId?: number;
 }
 
-export interface OpenCodeAlertStatus {
-  enabled: boolean;
-  running: boolean;
-  intervalSeconds: number;
-  thresholds: number[];
-  poolThresholdsUsd: Record<string, number>;
-  lastRunAt: string | null;
-  lastSuccessAt: string | null;
-  lastError: string | null;
-  deliveredEvents: number;
-}
-
-export interface OpenCodeDraft {
-  label: string;
-  workspaceId: string;
-  authCookie: string;
-  apiKey: string;
+export interface CatalogDraft {
+  name: string;
+  alias: string;
+  baseUrl: string;
+  group: string;
+  models: string;
+  owner: string;
+  note: string;
+  tags: string;
+  status: number;
+  ledgerBalance: string;
+  alertBalance: string;
 }

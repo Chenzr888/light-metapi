@@ -14,7 +14,7 @@ https://ai.sandboxai.top/upstream-balance/
 
 ## 资源结论
 
-2026-07-25 上线前快照：CY16 为 8 核、7.8 GiB 内存，当时约有 5.8 GiB 可用，磁盘约有 14 GiB 可用。看板集成 17 个 OpenCode 账号的实测峰值约 63 MiB；生产容器仍设置 512 MiB 硬上限、192 MiB 预留、768 MiB 内存加交换区上限、1 CPU 和 128 PID。因此当前资源足够，且单个看板异常不能无界挤占主业务资源。
+2026-07-25 上线前快照：CY16 为 8 核、7.8 GiB 内存，当时约有 5.8 GiB 可用，磁盘约有 14 GiB 可用。生产容器设置 512 MiB 硬上限、192 MiB 预留、768 MiB 内存加交换区上限、1 CPU 和 128 PID。因此当前资源足够，且单个看板异常不能无界挤占主业务资源。
 
 ## 权限边界
 
@@ -74,26 +74,13 @@ release_sha=$(git rev-parse HEAD)
 scripts/deploy-cy16.sh --sha "$release_sha" --plan
 ```
 
-计划会拒绝以下情况：worktree 不干净、当前不是 `main`、SHA 不是 `origin/main`、该 SHA 的 GitHub CI 未成功、镜像标签不是精确 SHA，或首次导入文件权限不是 `0600`。
-
-普通版本升级不会再次导入账号：
+计划会拒绝以下情况：worktree 不干净、当前不是 `main`、SHA 不是 `origin/main`、该 SHA 的 GitHub CI 未成功，或镜像标签不是精确 SHA。
 
 ```bash
 scripts/deploy-cy16.sh \
   --sha "$release_sha" \
   --confirm "cy16:${release_sha:0:12}"
 ```
-
-仅第一次迁移 OpenCode 账号时增加一次性参数：
-
-```bash
-scripts/deploy-cy16.sh \
-  --sha "$release_sha" \
-  --import-opencode /absolute/path/to/config.json \
-  --confirm "cy16:${release_sha:0:12}"
-```
-
-导入文件必须是 `0600`。脚本先核对账号数，上传到仅当前用户可读的 release 目录；候选和正式容器成功导入并加密后会删除明文，退出 trap 也会清理远端暂存文件。
 
 ## CY16 切换顺序
 
@@ -103,8 +90,8 @@ scripts/deploy-cy16.sh \
 2. 通过 GitHub API 获取该 SHA 成功 CI run 的唯一 artifact ID，以 16 路分段下载所保存的已测试镜像；下载后核对 API 声明大小，传到 CY16 后复核 SHA256、载入镜像并核对 OCI revision label。临时签名 URL 不写日志，CY16 不需要保存 GitHub 凭据。
 3. 给旧镜像增加不可变回滚 tag。
 4. 用 SQLite online backup API 备份数据库，合并 WAL、切换为单文件 DELETE journal，并对独立快照执行 `integrity_check`；同时备份加密密钥和 Session 密钥。
-5. 在生产备份副本上启动 `127.0.0.1:18756` 候选容器。候选关闭定时刷新和通知，验证数据库迁移、用户数、渠道数、OpenCode 账号数、鉴权和容器硬化参数。
-6. 候选通过后才把一次性导入文件放入生产数据目录，并只替换看板容器。
+5. 在生产备份副本上启动 `127.0.0.1:18756` 候选容器。候选关闭定时刷新和通知，验证数据库迁移、用户数、渠道数、鉴权和容器硬化参数。
+6. 候选通过后只替换看板容器。
 7. 验证容器健康、SQLite `quick_check`、管理员仍存在、未登录访问受保护接口返回 401、账号数、静态资源、公网完整链路、重启次数和数据权限。
 8. 任一步失败：切换前保持生产不动；切换后使用备份中固化的独立 rollback Compose 自动恢复旧镜像、数据库、两个密钥和切换前的 Compose 状态；回滚不依赖本次候选 Compose。
 
@@ -126,8 +113,6 @@ scripts/rollback-cy16.sh \
 
 - 公网首页 `https://ai.sandboxai.top/upstream-balance/` 返回 200，静态资源可加载。
 - `/_ub_api/auth/bootstrap` 返回 `needs_setup=false`，原看板管理员登录凭据继续使用。
-- 未登录请求 `/_ub_api/opencode/accounts` 返回 401。
-- OpenCode 子页显示预期账号数；首次上线为 17，后续发布保持上线前账号数。
 - `users`、`channels` 数量不变，SQLite 检查为 `ok`。
 - 容器为 `healthy`、`RestartCount=0`，只绑定 `127.0.0.1:8756`，资源限制生效。
 - Nginx、light-proxy、new-api 的容器 ID和启动时间不变。

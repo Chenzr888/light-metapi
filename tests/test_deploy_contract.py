@@ -35,7 +35,6 @@ class DeployContractTest(unittest.TestCase):
             "APP_ROOT=/home/ubuntu/upstream-balance",
             "pragma journal_mode=delete",
             'for suffix in ("-wal", "-shm")',
-            "IMPORT_PATH_SAFE=1",
             '--no-deps upstream-balance',
             'releases/$RELEASE_SHA/$ATTEMPT_ID',
         ):
@@ -76,7 +75,6 @@ class DeployContractTest(unittest.TestCase):
         for ignored_file in (ROOT / ".gitignore", ROOT / ".dockerignore"):
             content = ignored_file.read_text()
             self.assertIn("/config.json", content)
-            self.assertIn("opencode-import*.json", content)
 
     def test_compose_policy_rejects_an_accidental_second_service(self):
         with tempfile.TemporaryDirectory() as temp_dir:

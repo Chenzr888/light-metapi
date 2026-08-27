@@ -78,7 +78,6 @@ write_release_env() {
     printf 'UPSTREAM_BALANCE_ENV_FILE=%s\n' "$ENV_FILE"
     printf 'UPSTREAM_BALANCE_CONTAINER_NAME=%s\n' "$CONTAINER"
     printf 'UPSTREAM_BALANCE_BIND=%s\n' '127.0.0.1:8756'
-    printf 'OPENCODE_GO_ALERT_INTERVAL_SECONDS=%s\n' '300'
   } > "$RELEASE_ENV" || return 1
   chmod 600 "$RELEASE_ENV" || return 1
 }
@@ -90,7 +89,7 @@ restore_files() {
   docker run --rm --user 0:0 --entrypoint python \
     -v "$DATA_DIR:/data" -v "$source_dir:/backup:ro" "$image" -c '
 import os, shutil
-for name in ("upstreams.sqlite3-wal", "upstreams.sqlite3-shm", "opencode-import.json"):
+for name in ("upstreams.sqlite3-wal", "upstreams.sqlite3-shm"):
     path="/data/"+name
     if os.path.exists(path):
         os.unlink(path)
@@ -110,7 +109,6 @@ for name in ("upstreams.sqlite3", "secret.key", "session.secret"):
   UPSTREAM_BALANCE_ENV_FILE="$ENV_FILE" \
   UPSTREAM_BALANCE_CONTAINER_NAME="$CONTAINER" \
   UPSTREAM_BALANCE_BIND=127.0.0.1:8756 \
-  OPENCODE_GO_ALERT_INTERVAL_SECONDS=300 \
     docker compose --project-name upstream-balance \
       -f "$source_dir/rollback-compose.yml" \
       up -d --no-build --wait --wait-timeout 90 --no-deps upstream-balance || return 1
@@ -119,7 +117,7 @@ for name in ("upstreams.sqlite3", "secret.key", "session.secret"):
 verify_public() {
   local expected_counts=$1
   curl "${CURL_COMMON[@]}" http://127.0.0.1:8756/api/health >/dev/null || return 1
-  local bootstrap protected_code counts page
+  local bootstrap counts page
   counts=$(docker exec "$CONTAINER" python -c '
 import sqlite3
 db=sqlite3.connect("/app/data/upstreams.sqlite3")
@@ -127,7 +125,7 @@ result=db.execute("pragma quick_check").fetchone()[0]
 tables={row[0] for row in db.execute("select name from sqlite_master where type=\"table\"")}
 def count(name):
     return db.execute("select count(*) from "+name).fetchone()[0] if name in tables else 0
-print("{}|{}|{}|{}".format(result, count("users"), count("channels"), count("opencode_accounts")))
+print("{}|{}|{}".format(result, count("users"), count("channels")))
 db.close()') || return 1
   [ "$counts" = "ok|$expected_counts" ] || {
     log "rollback verification mismatch: expected=ok|$expected_counts actual=$counts"
@@ -137,9 +135,6 @@ db.close()') || return 1
   [ -n "$page" ] || return 1
   bootstrap=$(curl "${CURL_COMMON[@]}" "${PUBLIC_URL}_ub_api/auth/bootstrap") || return 1
   python3 -c 'import json,sys; p=json.loads(sys.stdin.read()); assert p["ok"] is True; assert p["data"]["needs_setup"] is False' <<< "$bootstrap" || return 1
-  protected_code=$(curl --connect-timeout 5 --max-time 20 --silent --output /dev/null --write-out '%{http_code}' \
-    "${PUBLIC_URL}_ub_api/opencode/accounts") || return 1
-  [ "$protected_code" = "401" ] || [ "$protected_code" = "404" ] || return 1
 }
 
 validate_rollback_compose() {
@@ -234,7 +229,7 @@ db=sqlite3.connect("file:/backup/upstreams.sqlite3?mode=ro", uri=True)
 tables={row[0] for row in db.execute("select name from sqlite_master where type=\"table\"")}
 def count(name):
     return db.execute("select count(*) from "+name).fetchone()[0] if name in tables else 0
-print("{}|{}|{}".format(count("users"), count("channels"), count("opencode_accounts")))
+print("{}|{}".format(count("users"), count("channels")))
 db.close()')
 
 exec 9>"$LOCK_FILE"
@@ -249,7 +244,7 @@ db=sqlite3.connect("/app/data/upstreams.sqlite3")
 tables={row[0] for row in db.execute("select name from sqlite_master where type=\"table\"")}
 def count(name):
     return db.execute("select count(*) from "+name).fetchone()[0] if name in tables else 0
-print("{}|{}|{}".format(count("users"), count("channels"), count("opencode_accounts")))
+print("{}|{}".format(count("users"), count("channels")))
 db.close()')
 mkdir -p "$EMERGENCY_DIR"
 chmod 700 "$EMERGENCY_DIR"
