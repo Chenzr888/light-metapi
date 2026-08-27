@@ -21,6 +21,7 @@ from urllib.parse import quote, urljoin
 import requests
 import auth_security
 import channel_catalog
+from metapi import remote_catalog
 from cryptography.fernet import Fernet
 from flask import Flask, jsonify, request, send_from_directory, session
 from werkzeug.security import check_password_hash, generate_password_hash
