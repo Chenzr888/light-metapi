@@ -297,6 +297,13 @@ def sync_catalog_accounts(new_api_username, new_api_password, sub2api_username, 
 
 
 def refresh_channel_catalog(send_alerts=False):
+    try:
+        live = remote_catalog.fetch_catalog()
+    except Exception as exc:
+        print(f"[catalog-remote] read failed, using snapshot: {exc}", flush=True)
+        live = None
+    if live is not None:
+        remote_catalog.write_catalog(live, CHANNEL_CATALOG_PATH)
     with db() as conn:
         changed = channel_catalog.sync_file(conn, CHANNEL_CATALOG_PATH)
         data = channel_catalog.list_catalog(conn)
